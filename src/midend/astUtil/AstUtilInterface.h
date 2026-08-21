@@ -60,7 +60,7 @@ namespace AstUtilInterface{
         case EnumVariant::Read: result.push_back("read"); break;
         case EnumVariant::Parameter: result.push_back("read"); result.push_back("parameter"); break;
         case EnumVariant::Return: result.push_back("read"); result.push_back("return"); break;
-        case EnumVariant::Init: result.push_back("read"); result.push_back("init"); break;
+        case EnumVariant::Init: result.push_back("init"); break;
         default:
           std::cerr << "Error: Unexpected enum value:" << (int)enum_ << "\n";
           assert(false);

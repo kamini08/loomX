@@ -1608,6 +1608,40 @@ print_attribute(Dwarf_Debug dbg, Dwarf_Die die, Dwarf_Half attr, Dwarf_Attribute
 #if DEBUG_PRINT_ATTRIBUTE
                printf ("valname = %s \n",valname.c_str());
 #endif
+            // Store decoded location as attribute
+               Dwarf_Half theform;
+               if (dwarf_whatform(attrib, &theform, &rose_dwarf_error) == DW_DLV_OK)
+                  {
+                    std::string decoded_location;
+                    if (theform == DW_FORM_exprloc || theform == DW_FORM_block ||
+                        theform == DW_FORM_block1 || theform == DW_FORM_block2 || theform == DW_FORM_block4)
+                       {
+                         Dwarf_Block* block = nullptr;
+                         if (dwarf_formblock(attrib, &block, &rose_dwarf_error) == DW_DLV_OK)
+                            {
+                              if (block->bl_len > 0)
+                                 {
+                                   uint8_t* data = static_cast<uint8_t*>(block->bl_data);
+                                   uint8_t op = data[0];
+                                   if (op == DW_OP_addr && block->bl_len >= 9)
+                                      {
+                                        uint64_t addr;
+                                        memcpy(&addr, &data[1], 8);
+                                        char buf[64];
+                                        snprintf(buf, sizeof(buf), "0x%lx", addr);
+                                        decoded_location = buf;
+                                      }
+                                 }
+                              dwarf_dealloc(dbg, block, DW_DLA_BLOCK);
+                            }
+                       }
+                    if (!decoded_location.empty())
+                       {
+                         const std::string attrName = stringify::Rose::BinaryAnalysis::Dwarf::DWARF_AT(attr);
+                         Sawyer::Attribute::Id attrId = Sawyer::Attribute::declareMaybe(attrName);
+                         asmDwarfConstruct->attributes().setAttribute(attrId, decoded_location);
+                       }
+                  }
                break;
              }
 

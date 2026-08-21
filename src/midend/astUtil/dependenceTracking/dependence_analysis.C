@@ -48,10 +48,16 @@ std::string CollectDependences::local_read_string(std::istream& input_file) {
              input_file >> c1;
              next_string += "::";
              Log.push("Seeing `::'. continue reading token " + next_string);
-             break;
-          } 
-          // Otherwise, seeing a single ':'
-          [[fallthrough]]; // Explicitly indicates intentional fall-through 
+          } else {
+            if (next_string != "") { 
+               input_file.putback(c);
+               Log.push("Seeing separator. Finished reading token " + next_string);
+            } else {
+               next_string.push_back(c);
+            }
+            return next_string;
+         }
+         break;
          }
        case '=':
           if (next_string.size()>8 && 
