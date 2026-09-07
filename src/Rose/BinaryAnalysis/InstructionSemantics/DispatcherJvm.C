@@ -206,14 +206,6 @@ namespace JvmSemantics {
     void methodReturn(Ops ops, I insn, SValue::Ptr value);
 
     void branch_goto_w(Ops ops, I insn, Args args);
-    void branch_if_acmpeq(Ops ops, I insn, Args args);
-    void branch_if_acmpne(Ops ops, I insn, Args args);
-    void branch_if_icmpeq(Ops ops, I insn, Args args);
-    void branch_if_icmpne(Ops ops, I insn, Args args);
-    void branch_if_icmplt(Ops ops, I insn, Args args);
-    void branch_if_icmpge(Ops ops, I insn, Args args);
-    void branch_if_icmpgt(Ops ops, I insn, Args args);
-    void branch_if_icmple(Ops ops, I insn, Args args);
     void branch_ifnonnull(Ops ops, I insn, Args args);
     void branch_ifnull(Ops ops, I insn, Args args);
     void branch_jsr(Ops ops, I insn, Args args);
@@ -402,14 +394,6 @@ namespace JvmSemantics {
     void methodReturn(Ops /*ops*/, I /*insn*/, SValue::Ptr /*value*/) { jvmUnsupported("methodReturn(value)"); }
 
     void branch_goto_w(Ops, I, Args) { jvmUnsupported("branch_goto_w"); }
-    void branch_if_acmpeq(Ops, I, Args) { jvmUnsupported("branch_if_acmpeq"); }
-    void branch_if_acmpne(Ops, I, Args) { jvmUnsupported("branch_if_acmpne"); }
-    void branch_if_icmpeq(Ops, I, Args) { jvmUnsupported("branch_if_icmpeq"); }
-    void branch_if_icmpne(Ops, I, Args) { jvmUnsupported("branch_if_icmpne"); }
-    void branch_if_icmplt(Ops, I, Args) { jvmUnsupported("branch_if_icmplt"); }
-    void branch_if_icmpge(Ops, I, Args) { jvmUnsupported("branch_if_icmpge"); }
-    void branch_if_icmpgt(Ops, I, Args) { jvmUnsupported("branch_if_icmpgt"); }
-    void branch_if_icmple(Ops, I, Args) { jvmUnsupported("branch_if_icmple"); }
     void branch_jsr(Ops, I, Args) { jvmUnsupported("branch_jsr"); }
     void branch_jsr_w(Ops, I, Args) { jvmUnsupported("branch_jsr_w"); }
     void branch_lookupswitch(Ops, I, Args) { jvmUnsupported("branch_lookupswitch"); }
@@ -520,7 +504,7 @@ namespace JvmSemantics {
         Static
     };
 
-    void execute_invoke(Ops ops, size_t index, SgAsmInstruction *insn, InvocationKind invocationKind) {
+    void execute_invoke(D d, Ops ops, size_t index, SgAsmInstruction *insn, InvocationKind invocationKind) {
         ASSERT_not_null(ops);
         ASSERT_not_null(insn);
 
@@ -538,34 +522,39 @@ namespace JvmSemantics {
         auto pool = jvmMethod->constant_pool();
         ASSERT_not_null(pool);
 
+        // Get the descriptor directly (valid even if the callee method can't be found)
         const std::string descriptor = DispatcherJvm::methodDescriptor(pool, index);
         const MethodDescriptor methodDesc = DescriptorParser::parseMethodDescriptor(descriptor);
         const bool hasReceiver = invocationKind != InvocationKind::Static;
 
-        // Need way to find ByteCode::Method for callee
-        auto calleeFrame = FrameState::instance(state->protoval(), Sawyer::Nothing(), ByteCode::Method::Ptr());
-        ASSERT_not_null(calleeFrame);
+        // Find the method, null if not found
+        auto calleeMethod = d->resolveMethod(pool, index);
 
-        // Pops arguments and, for instance methods, the receiver from the
-        // caller's stack and installs them in the callee's locals.
-        DispatcherJvm::initializeInvocationLocals(ops, calleeFrame, descriptor, hasReceiver);
+        auto calleeFrame = FrameState::instance(state->protoval(), Sawyer::Nothing(), calleeMethod);
+        ASSERT_not_null(calleeFrame);
 
         const Address callerResumeAddress = insn->get_address() + insn->get_size();
         calleeFrame->returnAddress(callerResumeAddress);
 
-        // For now, represent the invocation frame lifecycle without
-        // interpreting the callee.
-        state->pushFrame(calleeFrame);
+        // Pops arguments and, for instance methods, the receiver from the
+        // caller's stack and installs them in the callee frame's locals.
+        DispatcherJvm::initializeInvocationLocals(ops, calleeFrame, descriptor, hasReceiver);
 
-        const auto poppedFrame = state->popFrame();
-        ASSERT_require(poppedFrame == calleeFrame);
+        if (calleeMethod) {
+            // The method to call/invoke was found, push its frame and set the PC for the call
+            state->pushFrame(calleeFrame);
 
-        // Since the callee was summarized rather than interpreted, create
-        // an unknown result of the declared return type.
-        if (!methodDesc.returnType.isVoid()) {
-            auto result = DispatcherJvm::syntheticValue(state->protoval(), methodDesc.returnType);
-            ASSERT_not_null(result);
-            ops->pushOperand(result);
+            const RegisterDescriptor pcReg = d->instructionPointerRegister();
+            ops->writeRegister(pcReg, ops->number_(pcReg.nBits(), calleeMethod->address()));
+        }
+        else {
+            // External/system/unresolved call: summarize, no need to leave a synthetic frame on the stack.
+
+            if (!methodDesc.returnType.isVoid()) {
+                auto result = DispatcherJvm::syntheticValue(state->protoval(), methodDesc.returnType);
+                ASSERT_not_null(result);
+                ops->pushOperand(result);
+            }
         }
     }
 
@@ -603,8 +592,7 @@ namespace JvmSemantics {
                 ASSERT_require(value->kind() == ValueKind::Float64);
                 break;
             case LocalKind::Reference:
-                ASSERT_require(value->kind() == ValueKind::ObjectReference ||
-                               value->kind() == ValueKind::ArrayReference);
+                ASSERT_require(JvmSemantics::isReference(value));
                 break;
         }
 
@@ -1849,7 +1837,10 @@ struct IP_dup: P {
         auto v1 = ops->peekOperand();
         ASSERT_require2(v1->isJvmCategory1(), "dup requires top value to be category-1");
 
-        ops->pushOperand(v1->copy());
+        auto result = v1->copy();
+        ASSERT_require(result->must_equal(v1));
+
+        ops->pushOperand(result);
     }
 };
 
@@ -2787,9 +2778,26 @@ struct IP_idiv: P {
         // Run-time Exceptions:
         //   None specified other than VirtualMachineError subclasses.
 struct IP_if_acmpeq: P {
-    void p(D /*d*/, Ops ops, I insn, Args args) {
-        assert_args(insn, args, 2);
-        JvmSemantics::branch_if_acmpeq(ops, insn, args);
+    void p(D d, Ops ops, I insn, Args args) {
+        assert_args(insn, args, 1);
+
+        auto sval2 = ops->popOperand();
+        auto sval1 = ops->popOperand();
+
+        ASSERT_require(JvmSemantics::isReference(sval1));
+        ASSERT_require(JvmSemantics::isReference(sval2));
+
+        //TODO: create helper function
+        bool equals = true;
+        equals &= sval1->kind() == sval2->kind();
+        equals &= sval1->arrayLength() == sval2->arrayLength();
+        equals &= sval1->typeDescriptor() == sval2->typeDescriptor();
+        equals &= sval1->symbolName() == sval2->symbolName();
+        equals &= sval1->must_equal(sval2); // also handles the expression
+
+        auto condition = ops->boolean_(equals);
+
+        JvmSemantics::execute_condition(d, ops, insn, d->asS2(args[0]), condition);
     }
 };
 
@@ -2799,9 +2807,26 @@ struct IP_if_acmpeq: P {
         // Run-time Exceptions:
         //   None specified other than VirtualMachineError subclasses.
 struct IP_if_acmpne: P {
-    void p(D /*d*/, Ops ops, I insn, Args args) {
-        assert_args(insn, args, 2);
-        JvmSemantics::branch_if_acmpne(ops, insn, args);
+    void p(D d, Ops ops, I insn, Args args) {
+        assert_args(insn, args, 1);
+
+        auto sval2 = ops->popOperand();
+        auto sval1 = ops->popOperand();
+
+        ASSERT_require(JvmSemantics::isReference(sval1));
+        ASSERT_require(JvmSemantics::isReference(sval2));
+
+        //TODO: create helper function
+        bool equals = true;
+        equals &= sval1->kind() == sval2->kind();
+        equals &= sval1->arrayLength() == sval2->arrayLength();
+        equals &= sval1->typeDescriptor() == sval2->typeDescriptor();
+        equals &= sval1->symbolName() == sval2->symbolName();
+        equals &= sval1->must_equal(sval2); // also handles the expression
+
+        auto condition = ops->boolean_(!equals);
+
+        JvmSemantics::execute_condition(d, ops, insn, d->asS2(args[0]), condition);
     }
 };
 
@@ -2832,9 +2857,18 @@ struct IP_if_icmpeq: P {
         // Run-time Exceptions:
         //   None specified other than VirtualMachineError subclasses.
 struct IP_if_icmpne: P {
-    void p(D /*d*/, Ops ops, I insn, Args args) {
-        assert_args(insn, args, 2);
-        JvmSemantics::branch_if_icmpne(ops, insn, args);
+    void p(D d, Ops ops, I insn, Args args) {
+        assert_args(insn, args, 1);
+
+        auto sval2 = ops->popOperand();
+        auto sval1 = ops->popOperand();
+
+        ASSERT_require(sval1->kind() == ValueKind::Integer32);
+        ASSERT_require(sval2->kind() == ValueKind::Integer32);
+
+        auto condition = ops->isNotEqual(sval1, sval2);
+
+        JvmSemantics::execute_condition(d, ops, insn, d->asS2(args[0]), condition);
     }
 };
 
@@ -2844,9 +2878,18 @@ struct IP_if_icmpne: P {
         // Run-time Exceptions:
         //   None specified other than VirtualMachineError subclasses.
 struct IP_if_icmplt: P {
-    void p(D /*d*/, Ops ops, I insn, Args args) {
-        assert_args(insn, args, 2);
-        JvmSemantics::branch_if_icmplt(ops, insn, args);
+    void p(D d, Ops ops, I insn, Args args) {
+        assert_args(insn, args, 1);
+
+        auto sval2 = ops->popOperand();
+        auto sval1 = ops->popOperand();
+
+        ASSERT_require(sval1->kind() == ValueKind::Integer32);
+        ASSERT_require(sval2->kind() == ValueKind::Integer32);
+
+        auto condition = ops->isSignedLessThan(sval1, sval2);
+
+        JvmSemantics::execute_condition(d, ops, insn, d->asS2(args[0]), condition);
     }
 };
 
@@ -2856,9 +2899,18 @@ struct IP_if_icmplt: P {
         // Run-time Exceptions:
         //   None specified other than VirtualMachineError subclasses.
 struct IP_if_icmpge: P {
-    void p(D /*d*/, Ops ops, I insn, Args args) {
-        assert_args(insn, args, 2);
-        JvmSemantics::branch_if_icmpge(ops, insn, args);
+    void p(D d, Ops ops, I insn, Args args) {
+        assert_args(insn, args, 1);
+
+        auto sval2 = ops->popOperand();
+        auto sval1 = ops->popOperand();
+
+        ASSERT_require(sval1->kind() == ValueKind::Integer32);
+        ASSERT_require(sval2->kind() == ValueKind::Integer32);
+
+        auto condition = ops->isSignedGreaterThanOrEqual(sval1, sval2);
+
+        JvmSemantics::execute_condition(d, ops, insn, d->asS2(args[0]), condition);
     }
 };
 
@@ -2868,9 +2920,18 @@ struct IP_if_icmpge: P {
         // Run-time Exceptions:
         //   None specified other than VirtualMachineError subclasses.
 struct IP_if_icmpgt: P {
-    void p(D /*d*/, Ops ops, I insn, Args args) {
-        assert_args(insn, args, 2);
-        JvmSemantics::branch_if_icmpgt(ops, insn, args);
+    void p(D d, Ops ops, I insn, Args args) {
+        assert_args(insn, args, 1);
+
+        auto sval2 = ops->popOperand();
+        auto sval1 = ops->popOperand();
+
+        ASSERT_require(sval1->kind() == ValueKind::Integer32);
+        ASSERT_require(sval2->kind() == ValueKind::Integer32);
+
+        auto condition = ops->isSignedGreaterThan(sval1, sval2);
+
+        JvmSemantics::execute_condition(d, ops, insn, d->asS2(args[0]), condition);
     }
 };
 
@@ -2880,9 +2941,18 @@ struct IP_if_icmpgt: P {
         // Run-time Exceptions:
         //   None specified other than VirtualMachineError subclasses.
 struct IP_if_icmple: P {
-    void p(D /*d*/, Ops ops, I insn, Args args) {
-        assert_args(insn, args, 2);
-        JvmSemantics::branch_if_icmple(ops, insn, args);
+    void p(D d, Ops ops, I insn, Args args) {
+        assert_args(insn, args, 1);
+
+        auto sval2 = ops->popOperand();
+        auto sval1 = ops->popOperand();
+
+        ASSERT_require(sval1->kind() == ValueKind::Integer32);
+        ASSERT_require(sval2->kind() == ValueKind::Integer32);
+
+        auto condition = ops->isSignedLessThanOrEqual(sval1, sval2);
+
+        JvmSemantics::execute_condition(d, ops, insn, d->asS2(args[0]), condition);
     }
 };
 
@@ -3206,7 +3276,7 @@ struct IP_invokeinterface: P {
 struct IP_invokespecial: P {
     void p(D d, Ops ops, I insn, Args args) {
         assert_args(insn, args, 1);
-        JvmSemantics::execute_invoke(ops, d->asU2(args[0]), insn, InvocationKind::Special);
+        JvmSemantics::execute_invoke(d, ops, d->asU2(args[0]), insn, InvocationKind::Special);
     }
 };
 
@@ -3219,7 +3289,7 @@ struct IP_invokespecial: P {
 struct IP_invokestatic: P {
     void p(D d, Ops ops, I insn, Args args) {
         assert_args(insn, args, 1);
-        JvmSemantics::execute_invoke(ops, d->asU2(args[0]), insn, InvocationKind::Static);
+        JvmSemantics::execute_invoke(d, ops, d->asU2(args[0]), insn, InvocationKind::Static);
     }
 };
 
@@ -3232,7 +3302,7 @@ struct IP_invokestatic: P {
 struct IP_invokevirtual: P {
     void p(D d, Ops ops, I insn, Args args) {
         assert_args(insn, args, 1);
-        JvmSemantics::execute_invoke(ops, d->asU2(args[0]), insn, InvocationKind::Virtual);
+        JvmSemantics::execute_invoke(d, ops, d->asU2(args[0]), insn, InvocationKind::Virtual);
     }
 };
 
@@ -4653,13 +4723,13 @@ DispatcherJvm::initializeDispatchTable() {
     iprocSet(0x9e,  new Jvm::IP_ifle);
 
     iprocSet(0x9f,  new Jvm::IP_if_icmpeq);
-//  iprocSet(0xa0,  new Jvm::IP_if_icmpne); // if_icmpne (160 (0xa0))
-//  iprocSet(0xa1,  new Jvm::IP_if_icmplt); // if_icmplt (161 (0xa1))
-//  iprocSet(0xa2,  new Jvm::IP_if_icmpge); // if_icmpge (162 (0xa2))
-//  iprocSet(0xa3,  new Jvm::IP_if_icmpgt); // if_icmpgt (163 (0xa3))
-//  iprocSet(0xa4,  new Jvm::IP_if_icmple); // if_icmple (164 (0xa4))
-//  iprocSet(0xa5,  new Jvm::IP_if_acmpeq); // if_acmpeq (165 (0xa5))
-//  iprocSet(0xa6,  new Jvm::IP_if_acmpne); // if_acmpne (166 (0xa6))
+    iprocSet(0xa0,  new Jvm::IP_if_icmpne);
+    iprocSet(0xa1,  new Jvm::IP_if_icmplt);
+    iprocSet(0xa2,  new Jvm::IP_if_icmpge);
+    iprocSet(0xa3,  new Jvm::IP_if_icmpgt);
+    iprocSet(0xa4,  new Jvm::IP_if_icmple);
+    iprocSet(0xa5,  new Jvm::IP_if_acmpeq);
+    iprocSet(0xa6,  new Jvm::IP_if_acmpne);
 
     iprocSet(0xa7,  new Jvm::IP_goto_);
 //  iprocSet(0xa8,  new Jvm::IP_jsr);
@@ -4812,6 +4882,45 @@ DispatcherJvm::methodDescriptor(SgAsmJvmConstantPool *pool, size_t index) {
     return pool->get_utf8_string(entry->get_descriptor_index());
 }
 
+ByteCode::Method::Ptr
+DispatcherJvm::resolveMethod(SgAsmJvmConstantPool *pool, size_t index) {
+    auto entry = pool->get_entry(index);
+    ASSERT_not_null(entry);
+
+    ASSERT_require(entry->get_tag() == SgAsmJvmConstantPoolEntry::CONSTANT_Methodref);
+
+    auto classIndex = entry->get_class_index();
+    auto nameAndTypeIndex = entry->get_name_and_type_index();
+
+    // Class
+    auto classEntry = pool->get_entry(classIndex);
+    ASSERT_require(classEntry->get_tag() == SgAsmJvmConstantPoolEntry::CONSTANT_Class);
+    std::string className = pool->get_utf8_string(classEntry->get_name_index());
+
+    // Ignore classes from java/...
+    if (ByteCode::JvmContainer::isJvmSystemReserved(className)) {
+        return ByteCode::Method::Ptr();
+    }
+
+    // Method
+    auto nameAndTypeEntry = pool->get_entry(nameAndTypeIndex);
+    ASSERT_require(nameAndTypeEntry->get_tag() == SgAsmJvmConstantPoolEntry::CONSTANT_NameAndType);
+
+    std::string methodName = pool->get_utf8_string(nameAndTypeEntry->get_name_index());
+    std::string descriptor = pool->get_utf8_string(nameAndTypeEntry->get_descriptor_index());
+
+    // Class repository
+    const auto &repo = classRepository();
+
+    auto found = repo.find(className);
+    if (found == repo.end()) {
+        return ByteCode::Method::Ptr(); // ignore
+    }
+
+    auto bcClass = found->second;
+    return bcClass->findMethod(methodName, descriptor);
+}
+
 BaseSemantics::SValuePtr
 DispatcherJvm::syntheticValue(const BaseSemantics::SValuePtr &protoval,
                               const DescriptorType &type,
@@ -4962,6 +5071,11 @@ DispatcherJvm::completeReturn(BaseSemantics::RiscOperators *ops, BaseSemantics::
     auto poppedFrame = state->popFrame();
     ASSERT_require(poppedFrame == calleeFrame);
 
+    if (result) {
+        std::cerr << "\n\n--------------------- result = " << result << "\n";
+    }
+
+//TODO: write class + method + descriptor and result to file
     if (returnAddress) {
         // The caller frame is now current.
         if (result) {

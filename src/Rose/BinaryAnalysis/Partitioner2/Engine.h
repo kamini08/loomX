@@ -1047,7 +1047,7 @@ public:
      *  Repository of ByteCode Classes.
      *
      * @{ */
-    ClassRepository classes() const;
+    ClassRepository classRepository() const;
 
     /** Retrieve a ByteCode class from the repository by name */
     ByteCode::Class::Ptr classByName(const std::string &name) const;

@@ -4,6 +4,7 @@
 #ifdef ROSE_ENABLE_BINARY_ANALYSIS
 
 #include <Rose/BinaryAnalysis/BasicTypes.h>
+#include <Rose/BinaryAnalysis/ByteCode/Analysis.h>
 #include <Rose/BinaryAnalysis/InstructionSemantics/BaseSemantics/RiscOperators.h>
 
 #include <boost/enable_shared_from_this.hpp>
@@ -50,8 +51,11 @@ public:
     using Ptr = DispatcherPtr;
 
 private:
-    Architecture::BaseConstPtr architecture_;           // Required architecture
+    Architecture::BaseConstPtr architecture_; // Required architecture
     RiscOperatorsPtr operators_;
+
+    /** Non-owning pointer to the ByteCode class repository maintained by the Engine. */
+    const ByteCode::ClassRepository* classes_ = nullptr;
 
 protected:
     bool autoResetInstructionPointer_ = true;           /**< Reset instruction pointer register for each instruction. */
@@ -197,6 +201,12 @@ public:
      *  object. */
     virtual SgAsmInstruction* currentInstruction() const;
 
+    /** Returns a pointer to the ByteCode::Class repository.
+     *
+     *  The repository is maintained by the Engine. */
+    const ByteCode::ClassRepository& classRepository() const;
+    void classRepository(const ByteCode::ClassRepository *repo);
+
     /** Return a new undefined semantic value.
      *
      * @{ */
@@ -262,6 +272,8 @@ public:
      *  segment registers CS, DS, and SS typically refer to the entire machine memory and can be initialized to have a zero
      *  base address. */
     virtual void initializeState(const StatePtr&);
+
+    void classes(const ByteCode::ClassRepository *classes);
 
     /** Update the instruction pointer register.
      *

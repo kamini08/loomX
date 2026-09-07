@@ -65,7 +65,16 @@ void
 Method::finalize() {
     instructionMap_.clear();
 
-    for (SgAsmInstruction* insn : instructions()->get_instructions()) {
+    // Set the Method address to be the address of the first instruction
+    auto &insns = instructions()->get_instructions();
+    if (!insns.empty()) {
+        SgAsmInstruction *first = insns.front();
+        //TODO: add a setter (but move to partitioning and simply assert here
+        address_ = first->get_address();
+    }
+
+    // Initialize the instruction map
+    for (SgAsmInstruction* insn : insns) {
         ASSERT_not_null(insn);
 
         const bool inserted = instructionMap_.emplace(insn->get_address(), insn).second;
@@ -166,10 +175,25 @@ Class::strings() {
     return strings_;
 }
 
+ByteCode::Method::Ptr
+Class::findMethod(const std::string &name,
+                  const std::string &descriptor) const {
+    for (const Method::Ptr &method: methods_) {
+        ASSERT_not_null(method);
+
+        if (method->name() == name && method->descriptor() == descriptor) {
+            return method;
+        }
+    }
+
+    return ByteCode::Method::Ptr();
+}
+
 void
 Class::finalize() {
-    for (const Method::Ptr &method: methods_)
+    for (const Method::Ptr &method: methods_) {
         method->finalize();
+    }
 }
 
 void

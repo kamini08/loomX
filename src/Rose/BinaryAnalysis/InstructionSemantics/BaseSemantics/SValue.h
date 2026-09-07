@@ -112,7 +112,7 @@ public:
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Allocating virtual constructors.  undefined_() needs underscores, so we do so consistently for all
     // these allocating virtual c'tors.  However, we use copy() rather than copy_() because this one is fundamentally
-    // different: the object (this) is use for more than just selecting which virtual method to invoke.
+    // different: the object (this) is used for more than just selecting which virtual method to invoke.
     //
     // The naming scheme we use here is a bit different than for most other objects for historical reasons.  Most other classes
     // use "create" and "clone" as the virtual constructor names, but SValue uses names ending in undercore, and "copy". The

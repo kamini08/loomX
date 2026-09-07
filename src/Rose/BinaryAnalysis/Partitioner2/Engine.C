@@ -1244,7 +1244,7 @@ Engine::analysisClass() {
 }
 
 Engine::ClassRepository
-Engine::classes() const {
+Engine::classRepository() const {
     return classes_;
 }
 

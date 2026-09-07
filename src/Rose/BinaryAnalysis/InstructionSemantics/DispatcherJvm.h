@@ -111,6 +111,9 @@ public:
     /** Finds and returns the descriptor for a field from the constant pool at the given index */
     static std::string fieldDescriptor(SgAsmJvmConstantPool *pool, size_t index);
 
+    /** Finds and returns the JvmMethod for the object from the constant pool at the given index */
+    ByteCode::Method::Ptr resolveMethod(SgAsmJvmConstantPool *pool, size_t index);
+
     /** Creates a synthetic JVM value having the specified descriptor type and unknown value. */
     static BaseSemantics::SValuePtr
     syntheticValue(const BaseSemantics::SValuePtr &protoval,

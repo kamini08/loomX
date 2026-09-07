@@ -10,6 +10,7 @@
 #include <Rose/BinaryAnalysis/InstructionSemantics/BaseSemantics/RegisterStateGeneric.h>
 #include <Rose/BinaryAnalysis/InstructionSemantics/BaseSemantics/RiscOperators.h>
 #include <Rose/BinaryAnalysis/InstructionSemantics/BaseSemantics/State.h>
+#include <Rose/BinaryAnalysis/Partitioner2/Engine.h>
 #include <Rose/BinaryAnalysis/RegisterDictionary.h>
 
 #include <SgAsmBinaryAdd.h>
@@ -92,6 +93,17 @@ Dispatcher::protoval() const {
 SgAsmInstruction*
 Dispatcher::currentInstruction() const {
     return operators() ? operators()->currentInstruction() : NULL;
+}
+
+const ByteCode::ClassRepository&
+Dispatcher::classRepository() const {
+    ASSERT_not_null(classes_);
+    return *classes_;
+}
+
+void
+Dispatcher::classRepository(const ByteCode::ClassRepository* repo) {
+    classes_ = repo;
 }
 
 SValue::Ptr

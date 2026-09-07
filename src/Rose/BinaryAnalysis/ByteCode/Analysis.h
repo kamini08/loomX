@@ -25,6 +25,7 @@ class Namespace;
 
 using ClassPtr = Sawyer::SharedPointer<Class>;
 using NamespacePtr = Sawyer::SharedPointer<Namespace>;
+using ClassRepository = std::map<std::string, ClassPtr>;
 
 /** Base class for ByteCode Fields.
  *
@@ -165,6 +166,8 @@ class Class: public Sawyer::SharedObject,
     const std::string& name() const;
     const std::string& baseClassName() const;
     Address address() const;
+
+    ByteCode::Method::Ptr findMethod(const std::string &name, const std::string &descriptor) const;
 
     virtual std::string typeSeparator() const = 0;
     virtual const std::vector<std::string>& strings();
