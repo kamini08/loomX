@@ -527,20 +527,22 @@ namespace JvmSemantics {
         const MethodDescriptor methodDesc = DescriptorParser::parseMethodDescriptor(descriptor);
         const bool hasReceiver = invocationKind != InvocationKind::Static;
 
-        // Find the method, null if not found
+        // Find the method; null if it is not available for interpretation.
         auto calleeMethod = d->resolveMethod(pool, index);
 
         auto calleeFrame = FrameState::instance(state->protoval(), Sawyer::Nothing(), calleeMethod);
         ASSERT_not_null(calleeFrame);
 
-        const Address callerResumeAddress = insn->get_address() + insn->get_size();
-        calleeFrame->returnAddress(callerResumeAddress);
-
-        // Pops arguments and, for instance methods, the receiver from the
+        // Transfer/pop arguments and receiver (if it exists) from the
         // caller's stack and installs them in the callee frame's locals.
         DispatcherJvm::initializeInvocationLocals(ops, calleeFrame, descriptor, hasReceiver);
 
         if (calleeMethod) {
+            // Interpret the callee.
+            const Address callerResumeAddress = insn->get_address() + insn->get_size();
+
+            calleeFrame->returnAddress(callerResumeAddress);
+
             // The method to call/invoke was found, push its frame and set the PC for the call
             state->pushFrame(calleeFrame);
 
@@ -548,10 +550,10 @@ namespace JvmSemantics {
             ops->writeRegister(pcReg, ops->number_(pcReg.nBits(), calleeMethod->address()));
         }
         else {
-            // External/system/unresolved call: summarize, no need to leave a synthetic frame on the stack.
-
+            // External/system/unresolved call: summarize.
             if (!methodDesc.returnType.isVoid()) {
                 auto result = DispatcherJvm::syntheticValue(state->protoval(), methodDesc.returnType);
+
                 ASSERT_not_null(result);
                 ops->pushOperand(result);
             }
@@ -5065,15 +5067,16 @@ DispatcherJvm::completeReturn(BaseSemantics::RiscOperators *ops, BaseSemantics::
     auto calleeFrame = state->currentFrame();
     ASSERT_not_null(calleeFrame);
 
+    if (result) {
+        std::cerr << "\n\n--------------------- result = " << result << "\n";
+     // std::cerr << "method returned: " << *methodState->returnValue() << "\n";
+    }
+
     // Save before removing the frame.
     const auto returnAddress = calleeFrame->returnAddress();
 
     auto poppedFrame = state->popFrame();
     ASSERT_require(poppedFrame == calleeFrame);
-
-    if (result) {
-        std::cerr << "\n\n--------------------- result = " << result << "\n";
-    }
 
 //TODO: write class + method + descriptor and result to file
     if (returnAddress) {

@@ -306,10 +306,11 @@ State::hasInterruptState() const {
 
 FrameState::Ptr
 State::frameState() const {
-    for (const AddressSpace::Ptr &space: addressSpaces()) {
-        if (space->purpose() == AddressSpace::Purpose::FRAMES) {
-            if (auto retval = as<FrameState>(space))
-                return retval;
+    for (auto iter = addressSpaces_.rbegin(); iter != addressSpaces_.rend(); ++iter) {
+        if ((*iter)->purpose() == AddressSpace::Purpose::FRAMES) {
+            FrameState::Ptr frame = as<FrameState>(*iter);
+            ASSERT_not_null(frame);
+            return frame;
         }
     }
     return {};
@@ -383,7 +384,14 @@ State::popFrame() {
             FrameState::Ptr frame = as<FrameState>(*iter);
             ASSERT_not_null(frame);
 
+            // The operand stack should always be empty when the frame is popped
+            //TODO::
+#if 0
+            ASSERT_require(frame->stackSize() == 0);
+#endif
+
             addressSpaces_.erase(std::prev(iter.base()));
+
             return frame;
         }
     }
