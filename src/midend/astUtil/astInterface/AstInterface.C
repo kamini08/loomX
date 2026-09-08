@@ -2525,8 +2525,12 @@ IsAddressOfOp( const AstNodePtr& _s, AstNodePtr* ref)
 {  
   SgNode* s = AstNodePtrImpl(_s).get_ptr();
   if (s == 0) return false;
-  if (s->variantT() == V_SgAssignInitializer) {
-    s = isSgAssignInitializer(s)->get_operand();
+  switch (s->variantT()) {
+    case V_SgAssignInitializer: 
+        return IsAddressOfOp(isSgAssignInitializer(s)->get_operand(), ref); 
+    case V_SgCastExp:
+        return IsAddressOfOp(isSgCastExp(s)->get_operand(), ref); 
+    default: break;
   }
   if (s->variantT() == V_SgAddressOfOp) {
       if (ref != 0) *ref=isSgAddressOfOp(s)->get_operand();
@@ -2537,7 +2541,7 @@ IsAddressOfOp( const AstNodePtr& _s, AstNodePtr* ref)
 
 
 bool AstInterface::
-IsMemoryAllocation( const AstNodePtr& s, AstNodeType* exptype, AstNodePtr* init)
+IsMemoryAllocation( const AstNodePtr& s, AstNodeType* exptype, AstNodePtr* init, AstNodeList* dest)
 {
   AstNodePtrImpl s1 = SkipCasting(s.get_ptr()), f;
   if (IsFunctionCall(s1, &f)) {
@@ -2564,6 +2568,12 @@ IsMemoryAllocation( const AstNodePtr& s, AstNodeType* exptype, AstNodePtr* init)
      if (init != 0) {
        *init = is_new->get_constructor_args();
      }
+    if (dest != 0) {
+       auto* placements = is_new->get_placement_args();
+       if (placements != 0) { 
+          *dest = GetChildrenList(placements);
+       }
+    }
     return true;
   }
   return false;

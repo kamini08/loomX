@@ -342,7 +342,8 @@ public:
   static bool IsAddressOfOp( const AstNodePtr& _s, AstNodePtr* ref = 0);
   // returns if s references memory stores; add the stores into subrefs if the pointer is given.
   static bool IsMemoryAccess( const AstNodePtr& s, AstNodeList* subrefs = 0);
-  static bool IsMemoryAllocation( const AstNodePtr& s, AstNodeType* allocType = 0, AstNodePtr* init = 0);
+  // If s is a memory allocation, sets the type allocated, initialization, and whether an existing storage (dest) is used.
+  static bool IsMemoryAllocation( const AstNodePtr& s, AstNodeType* allocType = 0, AstNodePtr* init = 0, AstNodeList* dest = 0);
   static bool IsMemoryFree( const AstNodePtr& s, AstNodeType* freedType = 0, AstNodePtr* freedVariable=0);
 
   static bool IsExpression( const AstNodePtr& s, AstNodeType* exptype =0, AstNodePtr* strip_exp = 0);
