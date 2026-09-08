@@ -74,6 +74,9 @@ class Method: public Sawyer::SharedObject,
 
     virtual std::string descriptor() const = 0;
 
+    /* The method identity; class + name + descriptor */
+    virtual std::string identity() const;
+
     /* Annotate the AST (.e.g., add comments to instructions) */
     virtual void annotate() = 0;
 

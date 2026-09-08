@@ -61,6 +61,14 @@ Method::declaringClass(Class *declaringClass) {
     class_ = declaringClass;
 }
 
+std::string
+Method::identity() const {
+    Class* declClass = declaringClass();
+    ASSERT_not_null(declClass);
+
+    return declClass->name() + "." + name() + ":" + descriptor();
+}
+
 void
 Method::finalize() {
     instructionMap_.clear();
