@@ -203,8 +203,9 @@ FrameState::initializeForRootFrame() {
 
         SValue::Ptr argument;
 
-        // Initalize integers to zero for the root frame (TODO:command_line_argument)
-        if (kind == BaseSemantics::ValueKind::Integer32 || kind == BaseSemantics::ValueKind::Integer64) {
+        // Initalize integers and floats to zero for the root frame (TODO:command_line_argument)
+        if (kind == BaseSemantics::ValueKind::Integer32 || kind == BaseSemantics::ValueKind::Integer64 ||
+            kind == BaseSemantics::ValueKind::Float32   || kind == BaseSemantics::ValueKind::Float64) {
             argument = protoval->number_(nBits, 0);
         }
         else {

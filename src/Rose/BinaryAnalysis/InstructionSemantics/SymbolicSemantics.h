@@ -1095,6 +1095,8 @@ public:
     BaseSemantics::SValuePtr
     fpBinaryOp(const BaseSemantics::SValuePtr &a, const BaseSemantics::SValuePtr &b, FloatOp operation);
 
+    BaseSemantics::SValuePtr fpLessThan(const BaseSemantics::SValuePtr &lhs, const BaseSemantics::SValuePtr &rhs) override;
+
     BaseSemantics::SValuePtr fpAdd(const BaseSemantics::SValuePtr &lhs, const BaseSemantics::SValuePtr &rhs) override;
     BaseSemantics::SValuePtr fpSubtract(const BaseSemantics::SValuePtr &lhs, const BaseSemantics::SValuePtr &rhs) override;
     BaseSemantics::SValuePtr fpMultiply(const BaseSemantics::SValuePtr &lhs, const BaseSemantics::SValuePtr &rhs) override;

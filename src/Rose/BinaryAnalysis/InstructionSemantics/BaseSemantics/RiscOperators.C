@@ -490,6 +490,17 @@ RiscOperators::bitsToDouble(uint64_t bits) {
 }
 
 SValue::Ptr
+    RiscOperators::fpLessThan(const SValue::Ptr&, const SValue::Ptr&) {
+    throw NotImplemented("fpLessThan is not implemented", currentInstruction());
+}
+
+SValue::Ptr
+    RiscOperators::fpGreaterThan(const SValuePtr &lhs, const SValuePtr &rhs) {
+    // Reverse arguments
+    return fpLessThan(rhs, lhs);
+}
+
+SValue::Ptr
 RiscOperators::fpAdd(const SValue::Ptr&, const SValue::Ptr&) {
     throw NotImplemented("fpAdd is not implemented", currentInstruction());
 }

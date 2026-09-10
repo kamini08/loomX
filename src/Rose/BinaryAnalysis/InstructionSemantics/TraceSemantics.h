@@ -348,6 +348,8 @@ public:
     BaseSemantics::SValuePtr fpSign(const BaseSemantics::SValuePtr&, SgAsmFloatType*) override;
     BaseSemantics::SValuePtr fpEffectiveExponent(const BaseSemantics::SValuePtr&, SgAsmFloatType*) override;
 
+    BaseSemantics::SValuePtr fpLessThan(const BaseSemantics::SValuePtr&, const BaseSemantics::SValuePtr&) override;
+
     BaseSemantics::SValuePtr fpAdd(const BaseSemantics::SValuePtr&, const BaseSemantics::SValuePtr&) override;
     BaseSemantics::SValuePtr fpAdd(const BaseSemantics::SValuePtr&, const BaseSemantics::SValuePtr&,
                                    SgAsmFloatType*) override;

@@ -457,16 +457,20 @@ namespace JvmSemantics {
                 value->kind(ValueKind::Float32);
                 break;
 
-            case SgAsmJvmConstantPoolEntry::CONSTANT_Long:
-                value = ops->number_(64, entry->get_bytes());
+            case SgAsmJvmConstantPoolEntry::CONSTANT_Long: {
+                uint64_t bits = (static_cast<uint64_t>(entry->get_hi_bytes()) << 32) |
+                                 static_cast<uint64_t>(entry->get_low_bytes());
+                value = ops->number_(64, bits);
                 value->kind(ValueKind::Integer64);
                 break;
-
-            case SgAsmJvmConstantPoolEntry::CONSTANT_Double:
-                value = ops->number_(64, entry->get_bytes());
+            }
+            case SgAsmJvmConstantPoolEntry::CONSTANT_Double: {
+                uint64_t bits = (static_cast<uint64_t>(entry->get_hi_bytes()) << 32) |
+                                 static_cast<uint64_t>(entry->get_low_bytes());
+                value = ops->number_(64, bits);
                 value->kind(ValueKind::Float64);
                 break;
-
+            }
             case SgAsmJvmConstantPoolEntry::CONSTANT_String:
                 value = DispatcherJvm::syntheticObjectReference(ops->protoval(), "Ljava/lang/String;");
                 break;
@@ -789,6 +793,43 @@ namespace JvmSemantics {
             }
         }
         // Without an array-content model, the assignment is not retained.
+    }
+
+    void execute_fp_compare(Ops ops, BaseSemantics::ValueKind kind, int32_t nanResult) {
+        SgAsmFloatType* fpType{nullptr};
+        if (kind == ValueKind::Float32) {
+            fpType = SageBuilderAsm::buildIeee754Binary32();
+        }
+        else if (kind == ValueKind::Float64) {
+            fpType = SageBuilderAsm::buildIeee754Binary64();
+        }
+        else ASSERT_require2(false, "must be a floating point kind");
+
+        auto sval2 = ops->popOperand();
+        auto sval1 = ops->popOperand();
+
+        ASSERT_require(sval1->kind() == kind);
+        ASSERT_require(sval2->kind() == kind);
+
+        auto nan1 = ops->fpIsNan(sval1, fpType);
+        auto nan2 = ops->fpIsNan(sval2, fpType);
+        auto isNan = ops->or_(nan1, nan2);
+
+        auto lt = ops->fpLessThan(sval1, sval2);
+        auto gt = ops->fpGreaterThan(sval1, sval2);
+
+        auto minusOne = ops->number_(32, 0xffffffff);
+        auto zero     = ops->number_(32, 0);
+        auto one      = ops->number_(32, 1);
+
+        auto normal = ops->ite(lt, minusOne,
+                               ops->ite(gt, one, zero));
+
+        auto nanValue = nanResult < 0 ? minusOne : one;
+        auto result = ops->ite(isNan, nanValue, normal);
+
+        result->kind(BaseSemantics::ValueKind::Integer32);
+        ops->pushOperand(result);
     }
 
     Address branchTargetAddress(I insn, int32_t displacement) {
@@ -1547,9 +1588,9 @@ struct IP_dastore: P {
         // Run-time Exceptions:
         //   None specified other than VirtualMachineError subclasses.
 struct IP_dcmpl: P {
-    void p(D /*d*/, Ops /*ops*/, I insn, Args args) {
+    void p(D /*d*/, Ops ops, I insn, Args args) {
         assert_args(insn, args, 0);
-        ASSERT_require2(false, "dcmpl unimplemented");
+        JvmSemantics::execute_fp_compare(ops, ValueKind::Float64, -1);
     }
 };
 
@@ -1561,9 +1602,9 @@ struct IP_dcmpl: P {
         // Run-time Exceptions:
         //   None specified other than VirtualMachineError subclasses.
 struct IP_dcmpg: P {
-    void p(D /*d*/, Ops /*ops*/, I insn, Args args) {
+    void p(D /*d*/, Ops ops, I insn, Args args) {
         assert_args(insn, args, 0);
-        ASSERT_require2(false, "dcmpg unimplemented");
+        JvmSemantics::execute_fp_compare(ops, ValueKind::Float64, 1);
     }
 };
 
@@ -2118,9 +2159,9 @@ struct IP_fastore: P {
         // Run-time Exceptions:
         //   None specified other than VirtualMachineError subclasses.
 struct IP_fcmpl: P {
-    void p(D /*d*/, Ops /*ops*/, I insn, Args args) {
+    void p(D /*d*/, Ops ops, I insn, Args args) {
         assert_args(insn, args, 0);
-        ASSERT_require2(false, "fcmpl unimplemented");
+        JvmSemantics::execute_fp_compare(ops, ValueKind::Float32, -1);
     }
 };
 
@@ -2132,9 +2173,9 @@ struct IP_fcmpl: P {
         // Run-time Exceptions:
         //   None specified other than VirtualMachineError subclasses.
 struct IP_fcmpg: P {
-    void p(D /*d*/, Ops /*ops*/, I insn, Args args) {
+    void p(D /*d*/, Ops ops, I insn, Args args) {
         assert_args(insn, args, 0);
-        ASSERT_require2(false, "fcmpg unimplemented");
+        JvmSemantics::execute_fp_compare(ops, ValueKind::Float32, 1);
     }
 };
 
@@ -3684,9 +3725,26 @@ struct IP_lastore: P {
         // Run-time Exceptions:
         //   None specified other than VirtualMachineError subclasses.
 struct IP_lcmp: P {
-    void p(D /*d*/, Ops /*ops*/, I insn, Args args) {
+    void p(D /*d*/, Ops ops, I insn, Args args) {
         assert_args(insn, args, 0);
-        ASSERT_require2(false, "lcmp unimplemented");
+
+        auto sval2 = ops->popOperand();
+        auto sval1 = ops->popOperand();
+
+        ASSERT_require(sval1->kind() == ValueKind::Integer64);
+        ASSERT_require(sval2->kind() == ValueKind::Integer64);
+
+        auto lt = ops->isSignedLessThan(sval1, sval2);
+        auto gt = ops->isSignedGreaterThan(sval1, sval2);
+
+        auto minusOne = ops->number_(32, 0xffffffff);
+        auto zero     = ops->number_(32, 0);
+        auto one      = ops->number_(32, 1);
+
+        auto result = ops->ite(lt, minusOne, ops->ite(gt, one, zero));
+        result->kind(ValueKind::Integer32);
+
+        ops->pushOperand(result);
     }
 };
 
@@ -4712,11 +4770,11 @@ DispatcherJvm::initializeDispatchTable() {
     iprocSet(0x92,  new Jvm::IP_i2c);
     iprocSet(0x93,  new Jvm::IP_i2s);
 
-//  iprocSet(0x94,  new Jvm::IP_lcmp);
-//  iprocSet(0x95,  new Jvm::IP_fcml);
-//  iprocSet(0x96,  new Jvm::IP_fcmpg);
-//  iprocSet(0x97,  new Jvm::IP_dcmpl);
-//  iprocSet(0x98,  new Jvm::IP_dcmpg);
+    iprocSet(0x94,  new Jvm::IP_lcmp);
+    iprocSet(0x95,  new Jvm::IP_fcmpl);
+    iprocSet(0x96,  new Jvm::IP_fcmpg);
+    iprocSet(0x97,  new Jvm::IP_dcmpl);
+    iprocSet(0x98,  new Jvm::IP_dcmpg);
     iprocSet(0x99,  new Jvm::IP_ifeq);
     iprocSet(0x9a,  new Jvm::IP_ifne);
     iprocSet(0x9b,  new Jvm::IP_iflt);
@@ -5068,8 +5126,15 @@ DispatcherJvm::completeReturn(BaseSemantics::RiscOperators *ops, BaseSemantics::
     ASSERT_not_null(calleeFrame);
 
     if (result) {
-        std::cerr << "\n\n--------------------- result = " << result << "\n";
-     // std::cerr << "method returned: " << *methodState->returnValue() << "\n";
+        auto concreteValue = result->toUnsigned();
+        ASSERT_require(concreteValue);
+
+        auto method = calleeFrame->method();
+
+        std::string note = "@e@ "
+                           + method->identity() + " " + std::to_string(*concreteValue)
+                           + " @e@";
+        ops->comment(note);
     }
 
     // Save before removing the frame.
@@ -5078,7 +5143,6 @@ DispatcherJvm::completeReturn(BaseSemantics::RiscOperators *ops, BaseSemantics::
     auto poppedFrame = state->popFrame();
     ASSERT_require(poppedFrame == calleeFrame);
 
-//TODO: write class + method + descriptor and result to file
     if (returnAddress) {
         // The caller frame is now current.
         if (result) {

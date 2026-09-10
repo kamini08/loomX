@@ -742,6 +742,18 @@ public:
      *  amount to normalize the significand. */
     virtual SValuePtr fpEffectiveExponent(const SValuePtr &fpValue, SgAsmFloatType *fpType);
 
+    /** Compare two floating-point values.
+     *
+     *  Returns true if @p a is less than @p b, and false otherwise. All values have
+     *  the same type and kind. If either operand is not-a-number, the result is false. */
+    virtual SValuePtr fpLessThan(const SValuePtr &a, const SValuePtr &b);
+
+    /** Compare two floating-point values.
+     *
+     *  Returns true if @p a is greater than @p b, and false otherwise. All values have
+     *  the same type and kind. If either operand is not-a-number, the result is false. */
+    virtual SValuePtr fpGreaterThan(const SValuePtr &a, const SValuePtr &b);
+
     /** Add two floating-point values.
      *
      *  Adds two floating-point values and returns the sum.  All values have the same type and kind. */

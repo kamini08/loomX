@@ -1364,6 +1364,20 @@ RiscOperators::fpAdd(const BaseSemantics::SValue::Ptr &a, const BaseSemantics::S
 }
 
 BaseSemantics::SValue::Ptr
+RiscOperators::fpLessThan(const BaseSemantics::SValue::Ptr &a, const BaseSemantics::SValue::Ptr &b) {
+    before("fpLessThan", a, b);
+    try {
+        return check_width(after(subdomain_->fpLessThan(a, b)), a->nBits());
+    } catch (const BaseSemantics::Exception &e) {
+        after(e);
+        throw;
+    } catch (...) {
+        after_exception();
+        throw;
+    }
+}
+
+BaseSemantics::SValue::Ptr
 RiscOperators::fpAdd(const BaseSemantics::SValue::Ptr &a, const BaseSemantics::SValue::Ptr &b, SgAsmFloatType *abt) {
     before("fpAdd", a, b, abt);
     try {

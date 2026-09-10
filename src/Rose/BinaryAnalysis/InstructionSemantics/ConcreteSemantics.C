@@ -1077,6 +1077,52 @@ RiscOperators::fpConvert(const BaseSemantics::SValue::Ptr &a, BaseSemantics::Val
 }
 
 BaseSemantics::SValuePtr
+RiscOperators::fpLessThan(const BaseSemantics::SValuePtr &lhs,
+                          const BaseSemantics::SValuePtr &rhs) {
+    ASSERT_not_null(lhs);
+    ASSERT_not_null(rhs);
+    ASSERT_require2(lhs->kind() == rhs->kind(), "lhs and rhs ValueKinds must be the same");
+    ASSERT_require2(lhs->isConcrete(), "only concrete values");
+    ASSERT_require2(rhs->isConcrete(), "only concrete values");
+
+    switch (lhs->kind()) {
+      case BaseSemantics::ValueKind::Float32: {
+          ASSERT_require(lhs->nBits() == 32);
+          ASSERT_require(rhs->nBits() == 32);
+          ASSERT_require(sizeof(float) == sizeof(uint32_t));
+
+          const uint32_t lhsBits = static_cast<uint32_t>(lhs->toUnsigned().get());
+          const uint32_t rhsBits = static_cast<uint32_t>(rhs->toUnsigned().get());
+
+          float lv;
+          float rv;
+          std::memcpy(&lv, &lhsBits, sizeof lv);
+          std::memcpy(&rv, &rhsBits, sizeof rv);
+
+          return boolean_(lv < rv);
+      }
+
+      case BaseSemantics::ValueKind::Float64: {
+          ASSERT_require(lhs->nBits() == 64);
+          ASSERT_require(rhs->nBits() == 64);
+          ASSERT_require(sizeof(double) == sizeof(uint64_t));
+
+          const uint64_t lhsBits = lhs->toUnsigned().get();
+          const uint64_t rhsBits = rhs->toUnsigned().get();
+
+          double lv;
+          double rv;
+          std::memcpy(&lv, &lhsBits, sizeof lv);
+          std::memcpy(&rv, &rhsBits, sizeof rv);
+
+          return boolean_(lv < rv);
+        }
+
+        default: ASSERT_not_implemented("unsupported floating-point ValueKind");
+    }
+}
+
+BaseSemantics::SValuePtr
 RiscOperators::fpAdd(const BaseSemantics::SValuePtr &lhs,
                      const BaseSemantics::SValuePtr &rhs) {
     ASSERT_not_null(lhs);

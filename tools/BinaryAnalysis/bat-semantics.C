@@ -177,15 +177,18 @@ main(int argc, char *argv[]) {
 
     // Fetch information from the engine now that partitioning has finished
     bcClass = engine->analysisClass();
-    InstructionSemantics::BaseSemantics::StatePtr state = engine->state();
+    IS::BaseSemantics::StatePtr state = engine->state();
 
     SmtSolver::Ptr solver = SmtSolver::instance("none");
-    ops = InstructionSemantics::SymbolicSemantics::RiscOperators::instanceFromState(state, solver);
+    ops = IS::SymbolicSemantics::RiscOperators::instanceFromState(state, solver);
     ASSERT_not_null(ops);
 
     auto tops = IS::TraceSemantics::RiscOperators::instance(ops);
     IS::BaseSemantics::Dispatcher::Ptr cpu = partitioner->newDispatcher(tops);
     ASSERT_not_null(cpu);
+
+    auto repo = engine->classRepository();
+    cpu->classRepository(&repo);
 
     IS::BaseSemantics::StatePtr initialState = state->clone();
     ASSERT_not_null(initialState);
@@ -195,43 +198,48 @@ main(int argc, char *argv[]) {
         // Prepare the class and its methods for analysis
         bcClass->finalize();
 
-        for (auto bcMethod : bcClass->methods()) {
-            auto jvmMethod = BC::JvmMethod::promote(bcMethod);
+        for (auto bcMethod: bcClass->methods()) {
 
             // Start this method with an independent machine state.
             auto methodState = initialState->clone();
             ASSERT_not_null(methodState);
             ASSERT_require(!methodState->isTerminated());
 
-            // Create, initialize and push a new frame for the method
-            auto frame = IS::BaseSemantics::FrameState::instance(state->protoval(), Sawyer::Nothing(), bcMethod);
-            ASSERT_not_null(frame->method());
-            ASSERT_require(frame->method() == bcMethod);
+            // Create a root frame for the method and make it the current frame
+            auto rootFrame = IS::BaseSemantics::FrameState::instance(methodState->protoval(), Sawyer::Nothing(), bcMethod);
+            ASSERT_not_null(rootFrame->method());
+            ASSERT_require(rootFrame->method() == bcMethod);
 
-            methodState->pushFrame(frame);
+            methodState->pushFrame(rootFrame);
             ops->currentState(methodState);
 
             ASSERT_require(ops->currentState() == methodState);
-            ASSERT_require(methodState->currentFrame() == frame);
+            ASSERT_require(methodState->currentFrame() == rootFrame);
 
             const auto &instructions = bcMethod->instructions()->get_instructions();
 
             if (instructions.empty()) {
                 auto remainingFrame = methodState->popFrame();
-                ASSERT_require(remainingFrame == frame);
+                ASSERT_require(remainingFrame == rootFrame);
                 methodState->terminate();
             }
             else {
                 const RegisterDescriptor pcReg = cpu->instructionPointerRegister();
 
-                // Begin execution at the method's first instruction.
+                // Begin at the root method's first instruction.
                 ops->writeRegister(pcReg, ops->number_(pcReg.nBits(), instructions.front()->get_address()));
 
                 size_t nSteps = 0;
                 const size_t maxSteps = 100000;
 
-                while (!methodState->isTerminated() && methodState->currentFrame() == frame) {
-                    ASSERT_require2(++nSteps <= maxSteps, "method exceeded instruction step limit");
+                while (!methodState->isTerminated()) {
+                    ASSERT_require2(++nSteps <= maxSteps, "JVM execution exceeded instruction step limit");
+
+                    auto currentFrame = methodState->currentFrame();
+                    ASSERT_not_null(currentFrame);
+
+                    auto currentMethod = currentFrame->method();
+                    ASSERT_not_null(currentMethod);
 
                     auto pcValue = ops->readRegister(pcReg);
                     ASSERT_not_null(pcValue);
@@ -240,9 +248,11 @@ main(int argc, char *argv[]) {
                     ASSERT_require2(concretePc, "PC requires path splitting");
 
                     const Address pc = static_cast<Address>(*concretePc);
-                    SgAsmInstruction *insn = bcMethod->instructionAt(pc);
+
+                    SgAsmInstruction *insn = currentMethod->instructionAt(pc);
 
                     ASSERT_not_null2(insn, "PC does not identify an instruction in the current method");
+
                     ASSERT_require(pc == insn->get_address());
 
                     std::cerr << partitioner->unparse(insn) << "\n";
@@ -255,20 +265,14 @@ main(int argc, char *argv[]) {
             }
 
             ASSERT_not_null(methodState);
-
-            if (!methodState->isTerminated()) {
-                // Execution stopped without a root return. This might occur
-                // when a different frame became current or control left the
-                // method unexpectedly.
-                if (methodState->currentFrame() == frame) {
-                    auto remainingFrame = methodState->popFrame();
-                    ASSERT_require(remainingFrame == frame);
-                }
-                methodState->terminate();
-            }
+            ASSERT_require(methodState->isTerminated());
 
             if (methodState->returnValue()) {
-                std::cerr << "frame #" << frame->frameId() << " return: " << *methodState->returnValue() << "\n";
+                // root frame return value
+                auto concreteValue = methodState->returnValue()->toUnsigned();
+                if (concreteValue) {
+                    std::cerr << "return: " << *concreteValue << "\n";
+                }
             }
         }
     }
