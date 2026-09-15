@@ -3071,10 +3071,10 @@ bool ClangToSageTranslator::VisitDesignatedInitExpr(clang::DesignatedInitExpr * 
         SgExpression * expr = NULL;
         clang::DesignatedInitExpr::Designator * D = designated_init_expr->getDesignator(it-1);
         if (D->isFieldDesignator()) {
-#if (__clang__)  && (__clang_major__ >= 18)
+#if (__clang__)  && (__clang_major__ >= 17)
             SgSymbol * symbol = GetSymbolFromSymbolTable(D->getFieldDecl());
 #else
-            SgSymbol * symbol = GetSymbolFromSymbolTable(D->getField());
+            SgSymbol * symbol = GetSymbolFromSymbolTable(D->getFieldDecl());
 #endif
             SgVariableSymbol * var_sym = isSgVariableSymbol(symbol);
             ROSE_ASSERT(var_sym != NULL);
@@ -3137,7 +3137,7 @@ bool ClangToSageTranslator::VisitDesignatedInitExpr(clang::DesignatedInitExpr * 
         SgExpression * expr = NULL;
         clang::DesignatedInitExpr::Designator * D = designated_init_expr->getDesignator(it);
         if (D->isFieldDesignator()) {
-            SgSymbol * symbol = GetSymbolFromSymbolTable(D->getField());
+            SgSymbol * symbol = GetSymbolFromSymbolTable(D->getFieldDecl());
             SgVariableSymbol * var_sym = isSgVariableSymbol(symbol);
             ROSE_ASSERT(var_sym != NULL);
             expr = SageBuilder::buildVarRefExp_nfi(var_sym);

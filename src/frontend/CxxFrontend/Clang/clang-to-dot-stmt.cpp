@@ -4983,7 +4983,7 @@ bool ClangToDotTranslator::VisitDesignatedInitExpr(clang::DesignatedInitExpr * d
         SgExpression * expr = NULL;
         clang::DesignatedInitExpr::Designator * D = designated_init_expr->getDesignator(it);
         if (D->isFieldDesignator()) {
-            SgSymbol * symbol = GetSymbolFromSymbolTable(D->getField());
+            SgSymbol * symbol = GetSymbolFromSymbolTable(D->getFieldDecl());
             SgVariableSymbol * var_sym = isSgVariableSymbol(symbol);
             ROSE_ASSERT(var_sym != NULL);
             expr = SageBuilder::buildVarRefExp_nfi(var_sym);
@@ -5045,7 +5045,7 @@ bool ClangToDotTranslator::VisitDesignatedInitExpr(clang::DesignatedInitExpr * d
         SgExpression * expr = NULL;
         clang::DesignatedInitExpr::Designator * D = designated_init_expr->getDesignator(it);
         if (D->isFieldDesignator()) {
-            SgSymbol * symbol = GetSymbolFromSymbolTable(D->getField());
+            SgSymbol * symbol = GetSymbolFromSymbolTable(D->getFieldDecl());
             SgVariableSymbol * var_sym = isSgVariableSymbol(symbol);
             ROSE_ASSERT(var_sym != NULL);
             expr = SageBuilder::buildVarRefExp_nfi(var_sym);
@@ -5089,7 +5089,7 @@ bool ClangToDotTranslator::VisitDesignatedInitExpr(clang::DesignatedInitExpr * d
           oss << "designator[" << cnt++ << "]";
           if (it->isFieldDesignator()) {
               oss << " field";
-              node_desc.successors.push_back(std::pair<std::string, std::string>(oss.str(), Traverse(it->getField())));
+              node_desc.successors.push_back(std::pair<std::string, std::string>(oss.str(), Traverse(it->getFieldDecl())));
           }
          else if (it->isArrayDesignator()) {
             oss << " array";
@@ -5121,7 +5121,7 @@ bool ClangToDotTranslator::VisitDesignatedInitExpr(clang::DesignatedInitExpr * d
 #if (__clang__)  && (__clang_major__ >= 18)
                node_desc.successors.push_back(std::pair<std::string, std::string>(oss.str(), Traverse(it->getFieldDecl())));
 #else
-               node_desc.successors.push_back(std::pair<std::string, std::string>(oss.str(), Traverse(it->getField())));
+               node_desc.successors.push_back(std::pair<std::string, std::string>(oss.str(), Traverse(it->getFieldDecl())));
 #endif
              }
             else 

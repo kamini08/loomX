@@ -4,6 +4,7 @@ add_subdirectory(classMemberVariablesInLambdas)
 add_subdirectory(CodeThorn)
 add_subdirectory(featureVector)
 add_subdirectory(globalVariablesInLambdas)
+add_subdirectory(loomX)
 add_subdirectory(PortabilityTesting)
 add_subdirectory(ReadWriteSetGeneration)
 

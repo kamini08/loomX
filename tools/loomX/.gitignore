@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+loomX
+
+# Generated test outputs
+tests/rose_*.c
+tests/*_seq
+tests/*_gpu
+tests/*_cpu
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

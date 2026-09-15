@@ -3148,7 +3148,7 @@ bool ClangToSageTranslator::VisitStaticAssertDecl(clang::StaticAssertDecl * prag
         logger[WARN] << "Runtime error: tmp_condition != NULL && condition == NULL" << "\n";
         res = false;
     } else {
-#if (__clang__)  && (__clang_major__ >= 18)
+#if (__clang__)  && (__clang_major__ >= 17)
       clang::Expr* Message = pragma_static_assert_decl->getMessage();
       if (const auto *SL = dyn_cast<clang::StringLiteral>(Message)) {
          assert(SL->isUnevaluated() && "expected an unevaluated string");

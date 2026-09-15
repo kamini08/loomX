@@ -41,7 +41,7 @@
 # if defined(__APPLE__) && defined(__MACH__)
 #  include <termios.h>
 # else
-#  include <termio.h>
+#  include <termios.h>
 # endif
 #include <sys/ioctl.h>
 #endif
