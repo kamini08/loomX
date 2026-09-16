@@ -1,28 +1,64 @@
 #include "GpuProfitability.h"
 #include "LoopAnalysisUtil.h"
+#include "ReductionDetector.h"
 #include <iostream>
+
+using namespace loomX;
 
 GpuProfitability::GpuProfitability()
     : iterationEstimator_(canonicalChecker_) {}
 
 ParallelTarget GpuProfitability::classifyLoop(SgForStatement* loop) {
+    return summarize(loop).target;
+}
+
+loomX::LoopSummary GpuProfitability::summarize(SgForStatement* loop) {
     using namespace loomX;
 
-    // Canonical form is required for any parallelization.
-    const CanonicalResult& canonical = canonicalChecker_.analyze(loop);
-    if (canonical.form != CanonicalForm::CANONICAL) {
+    LoopSummary summary;
+    summary.loop = loop;
+
+    // 1. Canonical form.
+    summary.canonical = canonicalChecker_.analyze(loop);
+
+    // 2. Iteration count.
+    summary.iterationCount = iterationEstimator_.estimate(loop, false);
+
+    // 3. Access regularity.
+    summary.regularAccess = hasRegularAccessPattern(loop);
+
+    // 4. Divergence.
+    summary.divergence = divergenceAnalyzer_.analyze(loop);
+
+    // 5. Compute intensity.
+    summary.intensity = intensityEstimator_.analyze(loop, 8.0);
+
+    // 6. Reductions.
+    ReductionDetector reducer;
+    summary.reductions = reducer.analyze(loop);
+
+    // 7. Final target decision.
+    summary.target = decideTarget(summary);
+
+    return summary;
+}
+
+ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary) {
+    SgForStatement* loop = summary.loop;
+
+    // Non-canonical loops cannot be safely parallelized.
+    if (summary.canonical.form != loomX::CanonicalForm::CANONICAL) {
         std::cout << "[GpuProfitability] Loop at line "
                   << loop->get_file_info()->get_line()
-                  << " non-canonical (" << canonical.note << ")\n";
+                  << " non-canonical (" << summary.canonical.note << ")\n";
         return ParallelTarget::SEQUENTIAL;
     }
 
-    long iterations = iterationEstimator_.estimate(loop, false);
-    bool regular = hasRegularAccessPattern(loop);
-    DivergenceResult divergence = divergenceAnalyzer_.analyze(loop);
-    bool divergent = divergence.isDivergent;
-    ComputeIntensityResult intensity = intensityEstimator_.analyze(loop, 8.0);
-    bool computeHeavy = (intensity.classification == IntensityClass::COMPUTE_BOUND);
+    long iterations = summary.iterationCount;
+    bool regular = summary.regularAccess;
+    bool divergent = summary.divergence.isDivergent &&
+                     summary.divergence.kind != loomX::DivergenceKind::FUNCTION_CALL;
+    bool computeHeavy = (summary.intensity.classification == loomX::IntensityClass::COMPUTE_BOUND);
 
     std::cout << "[GpuProfitability] Loop at line "
               << loop->get_file_info()->get_line()
@@ -30,15 +66,14 @@ ParallelTarget GpuProfitability::classifyLoop(SgForStatement* loop) {
               << " regular=" << regular
               << " divergent=" << divergent
               << " computeHeavy=" << computeHeavy
-              << " (" << intensity.note << ")"
+              << " (" << summary.intensity.note << ")"
               << "\n";
 
     if (iterations >= 0 && iterations < 100) {
         return ParallelTarget::SEQUENTIAL;
     }
 
-    if (!regular || (divergent && divergence.kind != DivergenceKind::FUNCTION_CALL)) {
-        // Irregular or strongly divergent: CPU only if large enough.
+    if (!regular || divergent) {
         if (iterations >= 1000) {
             return ParallelTarget::CPU_OPENMP;
         }
@@ -83,7 +118,6 @@ bool GpuProfitability::hasRegularAccessPattern(SgForStatement* loop) {
 
 bool GpuProfitability::hasDivergentControlFlow(SgForStatement* loop) {
     loomX::DivergenceResult result = divergenceAnalyzer_.analyze(loop);
-    // Mild function-call divergence does not disqualify GPU for this legacy helper.
     if (result.kind == loomX::DivergenceKind::FUNCTION_CALL) return false;
     return result.isDivergent;
 }

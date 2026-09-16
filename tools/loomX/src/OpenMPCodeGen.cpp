@@ -1,37 +1,37 @@
 #include "OpenMPCodeGen.h"
+#include "LoopAnalysisUtil.h"
 #include <sstream>
 
-void OpenMPCodeGen::generatePragmas(SgForStatement* loop,
-                                    ParallelTarget target,
-                                    const std::set<SgInitializedName*>& privateVars,
-                                    const std::set<SgInitializedName*>& reductionVars,
-                                    const std::set<std::pair<SgInitializedName*, std::string>>& mapClauses,
-                                    const std::vector<loomX::ReductionInfo>& reductionDetails) {
-    switch (target) {
+using namespace loomX;
+
+void OpenMPCodeGen::generatePragmas(const loomX::LoopSummary& summary) {
+    switch (summary.target) {
         case ParallelTarget::CPU_OPENMP:
-            insertCPUPragma(loop, privateVars, reductionDetails);
+            insertCPUPragma(summary);
             break;
         case ParallelTarget::GPU_OFFLOAD:
-            insertGPUPragma(loop, privateVars, reductionDetails, mapClauses);
+            insertDeclareTargetPragmas(summary);
+            insertGPUPragma(summary);
             break;
         case ParallelTarget::SEQUENTIAL:
-            // No pragma inserted
+            // No pragma inserted.
             break;
     }
 }
 
-void OpenMPCodeGen::insertCPUPragma(SgForStatement* loop,
-                                    const std::set<SgInitializedName*>& privateVars,
-                                    const std::vector<loomX::ReductionInfo>& reductionDetails) {
+void OpenMPCodeGen::insertCPUPragma(const loomX::LoopSummary& summary) {
+    SgForStatement* loop = summary.loop;
+    if (!loop) return;
+
     std::ostringstream pragmaText;
     pragmaText << "omp parallel for";
 
-    if (!privateVars.empty()) {
-        pragmaText << " private(" << buildVarList(privateVars) << ")";
+    if (!summary.privateVars.empty()) {
+        pragmaText << " private(" << buildVarList(summary.privateVars) << ")";
     }
 
-    if (!reductionDetails.empty()) {
-        pragmaText << " " << buildReductionClause(reductionDetails);
+    if (!summary.reductions.empty()) {
+        pragmaText << " " << buildReductionClause(summary.reductions);
     }
 
     SgPragmaDeclaration* pragmaDecl =
@@ -40,34 +40,89 @@ void OpenMPCodeGen::insertCPUPragma(SgForStatement* loop,
     SageInterface::insertStatementBefore(loop, pragmaDecl);
 }
 
-void OpenMPCodeGen::insertGPUPragma(SgForStatement* loop,
-                                    const std::set<SgInitializedName*>& privateVars,
-                                    const std::vector<loomX::ReductionInfo>& reductionDetails,
-                                    const std::set<std::pair<SgInitializedName*, std::string>>& mapClauses) {
+void OpenMPCodeGen::insertGPUPragma(const loomX::LoopSummary& summary) {
+    SgForStatement* loop = summary.loop;
+    if (!loop) return;
+
     std::ostringstream pragmaText;
     pragmaText << "omp target teams distribute parallel for";
 
-    if (!privateVars.empty()) {
-        pragmaText << " private(" << buildVarList(privateVars) << ")";
+    if (!summary.privateVars.empty()) {
+        pragmaText << " private(" << buildVarList(summary.privateVars) << ")";
     }
 
-    if (!reductionDetails.empty()) {
-        pragmaText << " " << buildReductionClause(reductionDetails);
+    if (!summary.reductions.empty()) {
+        pragmaText << " " << buildReductionClause(summary.reductions);
     }
 
-    if (!mapClauses.empty()) {
-        pragmaText << " " << buildMapClause(mapClauses);
+    if (!summary.mapClauses.empty()) {
+        pragmaText << " " << buildMapClause(summary.mapClauses);
     }
 
     SgPragmaDeclaration* pragmaDecl =
         SageBuilder::buildPragmaDeclaration(pragmaText.str(),
                                             SageInterface::getScope(loop));
     SageInterface::insertStatementBefore(loop, pragmaDecl);
+}
+
+void OpenMPCodeGen::insertDeclareTargetPragmas(const loomX::LoopSummary& summary) {
+    SgForStatement* loop = summary.loop;
+    if (!loop) return;
+
+    // Find every function called inside the loop and mark its definition
+    // with #pragma omp declare target so it can be used on the GPU.
+    Rose_STL_Container<SgNode*> calls =
+        NodeQuery::querySubTree(loop, V_SgFunctionCallExp);
+
+    for (SgNode* node : calls) {
+        SgFunctionCallExp* call = isSgFunctionCallExp(node);
+        if (!call) continue;
+
+        SgFunctionDeclaration* callee = call->getAssociatedFunctionDeclaration();
+        if (!callee) continue;
+
+        // The declaration associated with a call may be non-defining.
+        // Look up the defining declaration to find the function body.
+        SgDeclarationStatement* definingDecl = callee->get_definingDeclaration();
+        SgFunctionDeclaration* definingFunc = isSgFunctionDeclaration(definingDecl);
+        if (!definingFunc) continue;
+
+        SgFunctionDefinition* def = definingFunc->get_definition();
+        if (!def) continue;
+
+        SgFunctionDeclaration* decl = def->get_declaration();
+        if (!decl) continue;
+
+        // Avoid inserting duplicate declare-target pragmas.
+        bool alreadyDeclared = false;
+        SgStatement* prev = SageInterface::getPreviousStatement(decl);
+        if (prev) {
+            SgPragmaDeclaration* prevPragma = isSgPragmaDeclaration(prev);
+            if (prevPragma) {
+                std::string text = prevPragma->unparseToString();
+                if (text.find("omp declare target") != std::string::npos) {
+                    alreadyDeclared = true;
+                }
+            }
+        }
+
+        if (alreadyDeclared) continue;
+
+        SgPragmaDeclaration* declareTarget =
+            SageBuilder::buildPragmaDeclaration("omp declare target",
+                                                decl->get_scope());
+        SageInterface::insertStatementBefore(decl, declareTarget);
+
+        SgPragmaDeclaration* endDeclareTarget =
+            SageBuilder::buildPragmaDeclaration("omp end declare target",
+                                                decl->get_scope());
+        SageInterface::insertStatementAfter(decl, endDeclareTarget);
+    }
 }
 
 std::string OpenMPCodeGen::buildMapClause(
     const std::set<std::pair<SgInitializedName*, std::string>>& mapClauses) {
-    // Group variables by direction
+    // Group variables by direction.
     std::map<std::string, std::vector<std::string>> directionGroups;
     for (const auto& [var, direction] : mapClauses) {
         directionGroups[direction].push_back(var->get_name().getString());

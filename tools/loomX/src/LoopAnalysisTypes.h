@@ -4,6 +4,9 @@
 
 namespace loomX {
 
+// Target for parallelized loop.
+enum class ParallelTarget { SEQUENTIAL, CPU_OPENMP, GPU_OFFLOAD };
+
 // Canonical form classification for a for-loop.
 enum class CanonicalForm {
     UNKNOWN,        // Not analyzed yet

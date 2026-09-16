@@ -2,10 +2,12 @@
 #include "InterproceduralAnalysis.h"
 #include "GpuProfitability.h"
 #include "OpenMPCodeGen.h"
-#include "ReductionDetector.h"
+#include "LoopSummary.h"
 #include "LoopAnalysisTypes.h"
 #include <iostream>
 #include <vector>
+
+using namespace loomX;
 
 // Find all for-loops in the AST
 class LoopCollector : public AstSimpleProcessing {
@@ -18,21 +20,13 @@ public:
     }
 };
 
-// Check if loop contains function calls
-bool hasFunctionCalls(SgForStatement* loop) {
-    Rose_STL_Container<SgNode*> calls =
-        NodeQuery::querySubTree(loop, V_SgFunctionCallExp);
-    return !calls.empty();
-}
-
-// Collect variables that need to be explicitely listed in an OpenMP private
-// clause.  Loop-index variables are implicitly private in OpenMP parallel-for
-// and must not be listed when declared in the for-init statement, because the
-// pragma is inserted outside the loop's scope.  Variables declared inside the
-// loop body are already local to each iteration and are also out of scope at
-// the pragma location, so they are skipped as well.
-void collectPrivateVars(SgForStatement* loop,
-                        std::set<SgInitializedName*>& privateVars) {
+// Fill private-variable information for the summary.
+// Loop-index variables are implicitly private in OpenMP parallel-for and must
+// not be listed when declared in the for-init statement, because the pragma is
+// inserted outside the loop's scope.  Variables declared inside the loop body
+// are already local to each iteration and are also out of scope at the pragma
+// location, so they are skipped as well.
+void fillPrivateVars(SgForStatement* loop, loomX::LoopSummary& summary) {
     SgInitializedName* loopVar = SageInterface::getLoopIndexVariable(loop);
     if (!loopVar) return;
 
@@ -49,19 +43,14 @@ void collectPrivateVars(SgForStatement* loop,
         }
     }
 
-    // For C89-style loops (index declared before the loop), we still prefer to
-    // rely on the implicit private semantics of the loop iteration variable in
-    // OpenMP parallel-for, which is universally supported.  Listing it is
-    // unnecessary and can trigger scope warnings with some compilers.
-    //
-    // If future heuristics need explicit privates for outer-scope temporaries,
-    // they can be added here after liveness analysis.
+    // For C89-style loops (index declared before the loop), we rely on the
+    // implicit private semantics of the loop iteration variable in OpenMP
+    // parallel-for.  If future heuristics need explicit privates for
+    // outer-scope temporaries, they can be added here after liveness analysis.
 }
 
-// Collect variables that are live-in and live-out (need map clauses for GPU)
-void collectMapVariables(SgForStatement* loop,
-                         std::set<std::pair<SgInitializedName*, std::string>>& mapClauses) {
-    // Collect all variable references including those inside array subscripts
+// Fill map-clause information for GPU target regions.
+void fillMapVariables(SgForStatement* loop, loomX::LoopSummary& summary) {
     std::set<SgInitializedName*> allVars;
     Rose_STL_Container<SgNode*> varRefs =
         NodeQuery::querySubTree(loop, V_SgVarRefExp);
@@ -72,20 +61,16 @@ void collectMapVariables(SgForStatement* loop,
         if (var) allVars.insert(var);
     }
 
-    // Collect read/write references in the loop
     std::vector<SgNode*> readRefs, writeRefs;
     SageInterface::collectReadWriteRefs(loop, readRefs, writeRefs);
 
-    // Track which variables are read, written, or both
     std::set<SgInitializedName*> readVars, writeVars;
-
     for (SgNode* ref : readRefs) {
         SgVarRefExp* varRef = isSgVarRefExp(ref);
         if (!varRef) continue;
         SgInitializedName* var = varRef->get_symbol()->get_declaration();
         if (var) readVars.insert(var);
     }
-
     for (SgNode* ref : writeRefs) {
         SgVarRefExp* varRef = isSgVarRefExp(ref);
         if (!varRef) continue;
@@ -93,13 +78,12 @@ void collectMapVariables(SgForStatement* loop,
         if (var) writeVars.insert(var);
     }
 
-    // For all variables in the loop, determine map direction
     for (SgInitializedName* var : allVars) {
-        // Skip loop index variable - it's handled by private clause
+        // Skip loop index variable - it's handled implicitly.
         SgInitializedName* loopVar = SageInterface::getLoopIndexVariable(loop);
         if (var == loopVar) continue;
 
-        // Skip loop index variables of nested loops - they are private to inner loops
+        // Skip nested loop index variables.
         Rose_STL_Container<SgNode*> nestedLoops =
             NodeQuery::querySubTree(loop->get_loop_body(), V_SgForStatement);
         bool isNestedLoopVar = false;
@@ -114,39 +98,65 @@ void collectMapVariables(SgForStatement* loop,
         }
         if (isNestedLoopVar) continue;
 
-        // Skip local variables declared inside the loop body itself
+        // Skip local variables declared inside the loop body itself.
         SgScopeStatement* varScope = var->get_scope();
         SgStatement* loopBody = loop->get_loop_body();
-        if (loopBody && varScope == loopBody->get_scope()) {
-            continue;
-        }
+        if (loopBody && varScope == loopBody->get_scope()) continue;
 
         bool isRead = readVars.find(var) != readVars.end();
         bool isWritten = writeVars.find(var) != writeVars.end();
 
         if (isRead && isWritten) {
-            mapClauses.insert({var, "tofrom"});
+            summary.mapClauses.insert({var, "tofrom"});
         } else if (isRead) {
-            mapClauses.insert({var, "to"});
+            summary.mapClauses.insert({var, "to"});
         } else if (isWritten) {
-            mapClauses.insert({var, "from"});
+            summary.mapClauses.insert({var, "from"});
         } else {
-            // Variable appears but read/write not detected (e.g., used only in sizeof)
-            // Default to tofrom to be safe
-            mapClauses.insert({var, "tofrom"});
+            summary.mapClauses.insert({var, "tofrom"});
+        }
+    }
+
+    // Reduction variables are handled by the reduction clause, not map.
+    std::set<SgInitializedName*> reductionVars = summary.getReductionVariables();
+    for (SgInitializedName* redVar : reductionVars) {
+        auto it = summary.mapClauses.begin();
+        while (it != summary.mapClauses.end()) {
+            if (it->first == redVar) {
+                it = summary.mapClauses.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 }
 
-// Detect reduction variables using the dedicated reduction analyzer.
-void collectReductionVars(SgForStatement* loop,
-                          std::set<SgInitializedName*>& reductionVars,
-                          std::vector<loomX::ReductionInfo>& reductionDetails) {
-    loomX::ReductionDetector detector;
-    reductionDetails = detector.analyze(loop);
-    for (const loomX::ReductionInfo& info : reductionDetails) {
-        if (info.variable) reductionVars.insert(info.variable);
+// Build a complete LoopSummary for a loop, including interprocedural safety.
+loomX::LoopSummary buildSummary(SgForStatement* loop,
+                                GpuProfitability& profitability,
+                                InterproceduralAnalysis& ipa) {
+    loomX::LoopSummary summary = profitability.summarize(loop);
+
+    // Interprocedural safety for function calls inside the loop.
+    Rose_STL_Container<SgNode*> calls =
+        NodeQuery::querySubTree(loop, V_SgFunctionCallExp);
+    summary.hasFunctionCalls = !calls.empty();
+    summary.allFunctionCallsSafe = true;
+    for (SgNode* node : calls) {
+        SgFunctionCallExp* call = isSgFunctionCallExp(node);
+        if (call && !ipa.isSafeForParallelLoop(call)) {
+            summary.allFunctionCallsSafe = false;
+            break;
+        }
     }
+
+    // Fill codegen inputs.
+    fillPrivateVars(loop, summary);
+    if (summary.target == ParallelTarget::GPU_OFFLOAD) {
+        fillMapVariables(loop, summary);
+    }
+
+    return summary;
 }
 
 int main(int argc, char* argv[]) {
@@ -227,94 +237,31 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // Check canonical form
-        if (!SageInterface::isCanonicalForLoop(loop)) {
-            std::cout << "  -> Skipped: not a canonical loop\n";
+        // Build the full loop summary (analyses + decision + codegen inputs).
+        loomX::LoopSummary summary = buildSummary(loop, profitability, ipa);
+
+        // Reject loops with unsafe function calls.
+        if (summary.hasFunctionCalls && !summary.allFunctionCallsSafe) {
+            std::cout << "  -> Function call not safe for parallelization\n";
             skipped++;
             continue;
         }
-
-        // Check for function calls
-        if (hasFunctionCalls(loop)) {
-            // Try interprocedural analysis
-            Rose_STL_Container<SgNode*> calls =
-                NodeQuery::querySubTree(loop, V_SgFunctionCallExp);
-            bool allSafe = true;
-            for (SgNode* node : calls) {
-                SgFunctionCallExp* call = isSgFunctionCallExp(node);
-                if (!ipa.isSafeForParallelLoop(call)) {
-                    std::cout << "  -> Function call not safe for parallelization\n";
-                    allSafe = false;
-                    break;
-                }
-            }
-            if (!allSafe) {
-                skipped++;
-                continue;
-            }
+        if (summary.hasFunctionCalls && summary.allFunctionCallsSafe) {
             std::cout << "  -> All function calls are safe (interprocedural analysis)\n";
         }
 
-        // GPU profitability analysis
-        ParallelTarget target = profitability.classifyLoop(loop);
-
-        if (target == ParallelTarget::SEQUENTIAL) {
+        // Apply the cost-model decision.
+        if (summary.target == ParallelTarget::SEQUENTIAL) {
             std::cout << "  -> Not profitable to parallelize\n";
             skipped++;
             continue;
         }
 
-        // Collect variable classifications
-        std::set<SgInitializedName*> privateVars;
-        std::set<SgInitializedName*> reductionVars;
-        std::vector<loomX::ReductionInfo> reductionDetails;
-        std::set<std::pair<SgInitializedName*, std::string>> mapClauses;
-
-        collectPrivateVars(loop, privateVars);
-        collectReductionVars(loop, reductionVars, reductionDetails);
-
-        if (target == ParallelTarget::GPU_OFFLOAD) {
-            collectMapVariables(loop, mapClauses);
-
-            // Remove reduction variables from map clauses (they use reduction clause instead)
-            for (SgInitializedName* redVar : reductionVars) {
-                auto it = mapClauses.begin();
-                while (it != mapClauses.end()) {
-                    if (it->first == redVar) {
-                        it = mapClauses.erase(it);
-                    } else {
-                        ++it;
-                    }
-                }
-            }
-
-            // Add omp declare target for functions called inside GPU region
-            Rose_STL_Container<SgNode*> calls =
-                NodeQuery::querySubTree(loop, V_SgFunctionCallExp);
-            for (SgNode* node : calls) {
-                SgFunctionCallExp* call = isSgFunctionCallExp(node);
-                if (!call) continue;
-                SgFunctionDeclaration* callee = call->getAssociatedFunctionDeclaration();
-                if (!callee) continue;
-                // Insert declare target pragma before function definition
-                SgFunctionDefinition* def = callee->get_definition();
-                if (def) {
-                    SgFunctionDeclaration* decl = def->get_declaration();
-                    if (decl) {
-                        SgPragmaDeclaration* declareTarget =
-                            SageBuilder::buildPragmaDeclaration("omp declare target",
-                                                                 decl->get_scope());
-                        SageInterface::insertStatementBefore(decl, declareTarget);
-                    }
-                }
-            }
-        }
-
-        // Insert OpenMP directives
-        codegen.generatePragmas(loop, target, privateVars, reductionVars, mapClauses, reductionDetails);
+        // Insert OpenMP directives based on the summary.
+        codegen.generatePragmas(summary);
         parallelizedLoops.insert(loop);
 
-        if (target == ParallelTarget::GPU_OFFLOAD) {
+        if (summary.target == ParallelTarget::GPU_OFFLOAD) {
             std::cout << "  -> GPU offload pragma inserted\n";
         } else {
             std::cout << "  -> CPU OpenMP pragma inserted\n";
@@ -328,7 +275,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Skipped: " << skipped << "\n";
 
     // Generate output
-    // Use unparse instead of backend to preserve inserted pragmas
     project->unparse();
 
     // Post-process: prepend #include <omp.h> if we parallelized anything
