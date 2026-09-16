@@ -51,6 +51,7 @@ run_test "recursive"
 run_test "pure_stdlib"
 run_test "disjoint_pointer"
 run_test "reduction_local"
+run_test "reduction_sub"
 
 # Baseline-mode check: intraprocedural tool must reject disjoint_pointer.
 echo "=== Checking --intraprocedural-baseline rejects disjoint_pointer ==="

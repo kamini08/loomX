@@ -104,10 +104,10 @@ ReductionOp ReductionDetector::detectBinaryReductionOp(SgInitializedName* var,
         }
     }
 
-    // x = x - y
+    // x = x - y  -> subtractive reduction
     if (SgSubtractOp* sub = isSgSubtractOp(rhs)) {
         if (exprContainsVar(sub->get_lhs_operand(), var)) {
-            return ReductionOp::ADD;  // x = x - y is a subtractive reduction
+            return ReductionOp::SUB;
         }
     }
 
