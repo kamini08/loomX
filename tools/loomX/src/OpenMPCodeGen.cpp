@@ -2,16 +2,17 @@
 #include <sstream>
 
 void OpenMPCodeGen::generatePragmas(SgForStatement* loop,
-                                      ParallelTarget target,
-                                      const std::set<SgInitializedName*>& privateVars,
-                                      const std::set<SgInitializedName*>& reductionVars,
-                                      const std::set<std::pair<SgInitializedName*, std::string>>& mapClauses) {
+                                    ParallelTarget target,
+                                    const std::set<SgInitializedName*>& privateVars,
+                                    const std::set<SgInitializedName*>& reductionVars,
+                                    const std::set<std::pair<SgInitializedName*, std::string>>& mapClauses,
+                                    const std::vector<loomX::ReductionInfo>& reductionDetails) {
     switch (target) {
         case ParallelTarget::CPU_OPENMP:
-            insertCPUPragma(loop, privateVars, reductionVars);
+            insertCPUPragma(loop, privateVars, reductionDetails);
             break;
         case ParallelTarget::GPU_OFFLOAD:
-            insertGPUPragma(loop, privateVars, reductionVars, mapClauses);
+            insertGPUPragma(loop, privateVars, reductionDetails, mapClauses);
             break;
         case ParallelTarget::SEQUENTIAL:
             // No pragma inserted
@@ -20,8 +21,8 @@ void OpenMPCodeGen::generatePragmas(SgForStatement* loop,
 }
 
 void OpenMPCodeGen::insertCPUPragma(SgForStatement* loop,
-                                     const std::set<SgInitializedName*>& privateVars,
-                                     const std::set<SgInitializedName*>& reductionVars) {
+                                    const std::set<SgInitializedName*>& privateVars,
+                                    const std::vector<loomX::ReductionInfo>& reductionDetails) {
     std::ostringstream pragmaText;
     pragmaText << "omp parallel for";
 
@@ -29,8 +30,8 @@ void OpenMPCodeGen::insertCPUPragma(SgForStatement* loop,
         pragmaText << " private(" << buildVarList(privateVars) << ")";
     }
 
-    if (!reductionVars.empty()) {
-        pragmaText << " " << buildReductionClause(reductionVars);
+    if (!reductionDetails.empty()) {
+        pragmaText << " " << buildReductionClause(reductionDetails);
     }
 
     SgPragmaDeclaration* pragmaDecl =
@@ -40,9 +41,9 @@ void OpenMPCodeGen::insertCPUPragma(SgForStatement* loop,
 }
 
 void OpenMPCodeGen::insertGPUPragma(SgForStatement* loop,
-                                      const std::set<SgInitializedName*>& privateVars,
-                                      const std::set<SgInitializedName*>& reductionVars,
-                                      const std::set<std::pair<SgInitializedName*, std::string>>& mapClauses) {
+                                    const std::set<SgInitializedName*>& privateVars,
+                                    const std::vector<loomX::ReductionInfo>& reductionDetails,
+                                    const std::set<std::pair<SgInitializedName*, std::string>>& mapClauses) {
     std::ostringstream pragmaText;
     pragmaText << "omp target teams distribute parallel for";
 
@@ -50,8 +51,8 @@ void OpenMPCodeGen::insertGPUPragma(SgForStatement* loop,
         pragmaText << " private(" << buildVarList(privateVars) << ")";
     }
 
-    if (!reductionVars.empty()) {
-        pragmaText << " " << buildReductionClause(reductionVars);
+    if (!reductionDetails.empty()) {
+        pragmaText << " " << buildReductionClause(reductionDetails);
     }
 
     if (!mapClauses.empty()) {
@@ -101,10 +102,28 @@ std::string OpenMPCodeGen::buildVarList(const std::set<SgInitializedName*>& vars
 }
 
 std::string OpenMPCodeGen::buildReductionClause(
-    const std::set<SgInitializedName*>& reductionVars) {
-    // For simplicity, assume all reductions are +
-    // Real implementation would detect the operator
+    const std::vector<loomX::ReductionInfo>& reductionDetails) {
+    // Group variables by operator string.
+    std::map<std::string, std::vector<std::string>> groups;
+    for (const loomX::ReductionInfo& info : reductionDetails) {
+        if (!info.variable) continue;
+        std::string op = info.opString.empty() ? "+" : info.opString;
+        groups[op].push_back(info.variable->get_name().getString());
+    }
+
     std::ostringstream oss;
-    oss << "reduction(+:" << buildVarList(reductionVars) << ")";
+    bool firstClause = true;
+    for (const auto& [op, vars] : groups) {
+        if (!firstClause) oss << " ";
+        firstClause = false;
+        oss << "reduction(" << op << ":";
+        bool firstVar = true;
+        for (const std::string& varName : vars) {
+            if (!firstVar) oss << ", ";
+            firstVar = false;
+            oss << varName;
+        }
+        oss << ")";
+    }
     return oss.str();
 }

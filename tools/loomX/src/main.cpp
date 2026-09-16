@@ -2,6 +2,8 @@
 #include "InterproceduralAnalysis.h"
 #include "GpuProfitability.h"
 #include "OpenMPCodeGen.h"
+#include "ReductionDetector.h"
+#include "LoopAnalysisTypes.h"
 #include <iostream>
 #include <vector>
 
@@ -23,24 +25,37 @@ bool hasFunctionCalls(SgForStatement* loop) {
     return !calls.empty();
 }
 
-// Collect variables that need to be private in OpenMP
+// Collect variables that need to be explicitely listed in an OpenMP private
+// clause.  Loop-index variables are implicitly private in OpenMP parallel-for
+// and must not be listed when declared in the for-init statement, because the
+// pragma is inserted outside the loop's scope.  Variables declared inside the
+// loop body are already local to each iteration and are also out of scope at
+// the pragma location, so they are skipped as well.
 void collectPrivateVars(SgForStatement* loop,
                         std::set<SgInitializedName*>& privateVars) {
-    // Loop index variable is always private
     SgInitializedName* loopVar = SageInterface::getLoopIndexVariable(loop);
-    if (loopVar) privateVars.insert(loopVar);
+    if (!loopVar) return;
 
-    // Variables declared inside the loop body are private
-    Rose_STL_Container<SgNode*> varDecls =
-        NodeQuery::querySubTree(loop->get_loop_body(), V_SgVariableDeclaration);
-    for (SgNode* node : varDecls) {
-        SgVariableDeclaration* varDecl = isSgVariableDeclaration(node);
-        if (!varDecl) continue;
-        SgInitializedNamePtrList& vars = varDecl->get_variables();
-        for (SgInitializedName* var : vars) {
-            privateVars.insert(var);
+    // If the loop variable is declared in the for-init statement, OpenMP
+    // handles it implicitly; do not add it to the private clause.
+    SgStatement* initStmt = loop->get_for_init_stmt();
+    if (initStmt) {
+        SgVariableDeclaration* initDecl = isSgVariableDeclaration(initStmt);
+        if (initDecl) {
+            SgInitializedNamePtrList& vars = initDecl->get_variables();
+            for (SgInitializedName* v : vars) {
+                if (v == loopVar) return;
+            }
         }
     }
+
+    // For C89-style loops (index declared before the loop), we still prefer to
+    // rely on the implicit private semantics of the loop iteration variable in
+    // OpenMP parallel-for, which is universally supported.  Listing it is
+    // unnecessary and can trigger scope warnings with some compilers.
+    //
+    // If future heuristics need explicit privates for outer-scope temporaries,
+    // they can be added here after liveness analysis.
 }
 
 // Collect variables that are live-in and live-out (need map clauses for GPU)
@@ -123,70 +138,14 @@ void collectMapVariables(SgForStatement* loop,
     }
 }
 
-// Detect reduction variables (e.g., sum = sum + x, sum += x)
+// Detect reduction variables using the dedicated reduction analyzer.
 void collectReductionVars(SgForStatement* loop,
-                          std::set<SgInitializedName*>& reductionVars) {
-    Rose_STL_Container<SgNode*> exprStmts =
-        NodeQuery::querySubTree(loop->get_loop_body(), V_SgExprStatement);
-
-    for (SgNode* node : exprStmts) {
-        SgExprStatement* stmt = isSgExprStatement(node);
-        if (!stmt) continue;
-        SgExpression* expr = stmt->get_expression();
-        if (!expr) continue;
-
-        // Check for compound assignments: +=, -=, *=
-        SgPlusAssignOp* plusAssign = isSgPlusAssignOp(expr);
-        SgMinusAssignOp* minusAssign = isSgMinusAssignOp(expr);
-        SgMultAssignOp* multAssign = isSgMultAssignOp(expr);
-
-        if (plusAssign || minusAssign || multAssign) {
-            SgExpression* lhs = nullptr;
-            if (plusAssign) lhs = plusAssign->get_lhs_operand();
-            else if (minusAssign) lhs = minusAssign->get_lhs_operand();
-            else if (multAssign) lhs = multAssign->get_lhs_operand();
-
-            SgVarRefExp* lhsVar = isSgVarRefExp(lhs);
-            if (lhsVar) {
-                SgInitializedName* var = lhsVar->get_symbol()->get_declaration();
-                if (var) reductionVars.insert(var);
-            }
-            continue;
-        }
-
-        // Check for binary assignments: x = x + expr, x = expr + x
-        SgAssignOp* assign = isSgAssignOp(expr);
-        if (!assign) continue;
-
-        SgVarRefExp* lhsVar = isSgVarRefExp(assign->get_lhs_operand());
-        if (!lhsVar) continue;
-
-        SgInitializedName* var = lhsVar->get_symbol()->get_declaration();
-        if (!var) continue;
-
-        SgExpression* rhs = assign->get_rhs_operand();
-        if (!rhs) continue;
-
-        // Check if var appears on RHS with +, -, *, min, max
-        Rose_STL_Container<SgNode*> rhsVarRefs =
-            NodeQuery::querySubTree(rhs, V_SgVarRefExp);
-        bool varOnRhs = false;
-        for (SgNode* rhsNode : rhsVarRefs) {
-            SgVarRefExp* rhsVar = isSgVarRefExp(rhsNode);
-            if (rhsVar && rhsVar->get_symbol()->get_declaration() == var) {
-                varOnRhs = true;
-                break;
-            }
-        }
-
-        if (varOnRhs) {
-            SgAddOp* addOp = isSgAddOp(rhs);
-            SgSubtractOp* subOp = isSgSubtractOp(rhs);
-            SgMultiplyOp* mulOp = isSgMultiplyOp(rhs);
-            if (addOp || subOp || mulOp) {
-                reductionVars.insert(var);
-            }
-        }
+                          std::set<SgInitializedName*>& reductionVars,
+                          std::vector<loomX::ReductionInfo>& reductionDetails) {
+    loomX::ReductionDetector detector;
+    reductionDetails = detector.analyze(loop);
+    for (const loomX::ReductionInfo& info : reductionDetails) {
+        if (info.variable) reductionVars.insert(info.variable);
     }
 }
 
@@ -308,10 +267,11 @@ int main(int argc, char* argv[]) {
         // Collect variable classifications
         std::set<SgInitializedName*> privateVars;
         std::set<SgInitializedName*> reductionVars;
+        std::vector<loomX::ReductionInfo> reductionDetails;
         std::set<std::pair<SgInitializedName*, std::string>> mapClauses;
 
         collectPrivateVars(loop, privateVars);
-        collectReductionVars(loop, reductionVars);
+        collectReductionVars(loop, reductionVars, reductionDetails);
 
         if (target == ParallelTarget::GPU_OFFLOAD) {
             collectMapVariables(loop, mapClauses);
@@ -351,7 +311,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Insert OpenMP directives
-        codegen.generatePragmas(loop, target, privateVars, reductionVars, mapClauses);
+        codegen.generatePragmas(loop, target, privateVars, reductionVars, mapClauses, reductionDetails);
         parallelizedLoops.insert(loop);
 
         if (target == ParallelTarget::GPU_OFFLOAD) {

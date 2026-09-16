@@ -1,28 +1,39 @@
 #pragma once
 #include "rose.h"
+#include "LoopAnalysisTypes.h"
+#include "LoopCanonicalChecker.h"
+#include "IterationCountEstimator.h"
+#include "DivergenceAnalyzer.h"
+#include "ComputeIntensityEstimator.h"
 
 // Target for parallelized loop
 enum class ParallelTarget { SEQUENTIAL, CPU_OPENMP, GPU_OFFLOAD };
 
-// GPU profitability heuristic
+// GPU profitability heuristic.  Delegates to the dedicated analyzers for
+// canonical-form checking, iteration-count estimation, divergence analysis,
+// and compute-intensity estimation.
 class GpuProfitability {
 public:
+    GpuProfitability();
+
     // Analyze a loop and decide where it should run
     ParallelTarget classifyLoop(SgForStatement* loop);
 
+    // Access the underlying analyzers for detailed diagnostics.
+    loomX::LoopCanonicalChecker& getCanonicalChecker() { return canonicalChecker_; }
+    loomX::IterationCountEstimator& getIterationEstimator() { return iterationEstimator_; }
+    loomX::DivergenceAnalyzer& getDivergenceAnalyzer() { return divergenceAnalyzer_; }
+    loomX::ComputeIntensityEstimator& getIntensityEstimator() { return intensityEstimator_; }
+
 private:
-    // Evaluate a constant integer expression (-1 if not constant)
-    long evaluateExpression(SgExpression* expr);
+    loomX::LoopCanonicalChecker canonicalChecker_;
+    loomX::IterationCountEstimator iterationEstimator_;
+    loomX::DivergenceAnalyzer divergenceAnalyzer_;
+    loomX::ComputeIntensityEstimator intensityEstimator_;
 
-    // Estimate iteration count (conservative lower bound)
+    // Legacy helpers retained for backward compatibility.
     long estimateIterationCount(SgForStatement* loop);
-
-    // Check if memory access pattern is regular (affine array subscripts)
     bool hasRegularAccessPattern(SgForStatement* loop);
-
-    // Check for divergent control flow within loop body
     bool hasDivergentControlFlow(SgForStatement* loop);
-
-    // Check if loop contains only simple arithmetic (FLOP-friendly)
     bool isComputeIntensive(SgForStatement* loop);
 };
