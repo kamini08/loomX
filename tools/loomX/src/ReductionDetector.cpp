@@ -29,6 +29,8 @@ std::vector<ReductionInfo> ReductionDetector::analyze(SgForStatement* loop) {
             if (!lhsVar) continue;
 
             info.variable = lhsVar->get_symbol()->get_declaration();
+            if (isLoopLocalVariable(info.variable, loop)) continue;
+
             info.op = detectCompoundAssignOp(compound);
             if (info.op != ReductionOp::UNKNOWN) {
                 info.opString = opToString(info.op);
@@ -42,6 +44,7 @@ std::vector<ReductionInfo> ReductionDetector::analyze(SgForStatement* loop) {
             SgInitializedName* var = nullptr;
             ReductionOp op = ReductionOp::UNKNOWN;
             if (isReductionAssignment(assign, var, op)) {
+                if (isLoopLocalVariable(var, loop)) continue;
                 info.variable = var;
                 info.op = op;
                 info.opString = opToString(op);
@@ -56,7 +59,9 @@ std::vector<ReductionInfo> ReductionDetector::analyze(SgForStatement* loop) {
             SgExpression* operand = uop->get_operand();
             SgVarRefExp* varRef = isSgVarRefExp(skipCasts(operand));
             if (varRef) {
-                info.variable = varRef->get_symbol()->get_declaration();
+                SgInitializedName* var = varRef->get_symbol()->get_declaration();
+                if (isLoopLocalVariable(var, loop)) continue;
+                info.variable = var;
                 info.op = isSgPlusPlusOp(expr) ? ReductionOp::ADD : ReductionOp::SUB;
                 info.opString = opToString(info.op);
                 results.push_back(info);
@@ -223,6 +228,33 @@ bool ReductionDetector::isReductionAssignment(SgAssignOp* assign,
         outVar = var;
         outOp = binOp;
         return true;
+    }
+
+    return false;
+}
+
+bool ReductionDetector::isLoopLocalVariable(SgInitializedName* var,
+                                            SgForStatement* loop) const {
+    if (!var || !loop) return false;
+
+    // Variables declared in the loop initializer are private to each iteration.
+    Rose_STL_Container<SgNode*> initStmts =
+        NodeQuery::querySubTree(loop->get_for_init_stmt(), V_SgInitializedName);
+    for (SgNode* node : initStmts) {
+        if (isSgInitializedName(node) == var) return true;
+    }
+
+    // Variables declared in the loop body (or any nested scope inside it)
+    // are private to the iteration.
+    SgStatement* body = loop->get_loop_body();
+    SgScopeStatement* varScope = var->get_scope();
+    if (!varScope || !body) return false;
+
+    SgNode* current = varScope;
+    while (current) {
+        if (current == body) return true;
+        if (isSgFunctionDefinition(current)) break;
+        current = current->get_parent();
     }
 
     return false;

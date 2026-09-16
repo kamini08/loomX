@@ -39,4 +39,7 @@ private:
     bool hasRegularAccessPattern(SgForStatement* loop);
     bool hasDivergentControlFlow(SgForStatement* loop);
     bool isComputeIntensive(SgForStatement* loop);
+
+    // True if the loop body contains any nested for-loop.
+    bool hasNestedLoops(SgForStatement* loop);
 };

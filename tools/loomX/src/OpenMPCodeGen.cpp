@@ -120,12 +120,35 @@ void OpenMPCodeGen::insertDeclareTargetPragmas(const loomX::LoopSummary& summary
     }
 }
 
+// Build a mapped variable reference. For arrays with a known constant size,
+// emit an array section (e.g., "A[0:1024]"). For pointers or arrays whose
+// size cannot be determined, fall back to the bare variable name.
+static std::string buildMappedVarName(SgInitializedName* var) {
+    if (!var) return "";
+
+    std::string name = var->get_name().getString();
+    SgType* type = var->get_type();
+    if (!type) return name;
+
+    type = type->stripType(SgType::STRIP_MODIFIER_TYPE | SgType::STRIP_TYPEDEF_TYPE);
+    SgArrayType* arrType = isSgArrayType(type);
+    if (!arrType) return name;
+
+    SgExpression* index = arrType->get_index();
+    if (!index) return name;
+
+    std::string sizeStr = index->unparseToString();
+    if (sizeStr.empty()) return name;
+
+    return name + "[0:" + sizeStr + "]";
+}
+
 std::string OpenMPCodeGen::buildMapClause(
     const std::set<std::pair<SgInitializedName*, std::string>>& mapClauses) {
     // Group variables by direction.
     std::map<std::string, std::vector<std::string>> directionGroups;
     for (const auto& [var, direction] : mapClauses) {
-        directionGroups[direction].push_back(var->get_name().getString());
+        directionGroups[direction].push_back(buildMappedVarName(var));
     }
 
     std::ostringstream oss;

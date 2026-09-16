@@ -93,11 +93,11 @@ enum class IntensityClass {
 // Result of compute-intensity estimation.
 struct ComputeIntensityResult {
     IntensityClass classification = IntensityClass::UNKNOWN;
-    double flopsPerMemoryOp = 0.0;  // FLOPs per memory access
-    int flopCount = 0;              // Static estimate of FP operations
-    int memoryOpCount = 0;          // Static estimate of memory accesses
-    int integerOpCount = 0;         // Static estimate of integer operations
-    bool hasHeavyMath = false;      // sin/cos/sqrt/exp/log/etc.
+    double flopsPerMemoryOp = 0.0;   // FLOPs per memory access
+    long long flopCount = 0;         // Static estimate of FP operations
+    long long memoryOpCount = 0;     // Static estimate of memory accesses
+    long long integerOpCount = 0;    // Static estimate of integer operations
+    bool hasHeavyMath = false;       // sin/cos/sqrt/exp/log/etc.
     std::string note;
 };
 

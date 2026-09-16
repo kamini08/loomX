@@ -72,6 +72,17 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         set(CMAKE_INSTALL_RPATH "${ROSE_LIB_DIR}")
     endif()
 
+    # ROSE links against the Clang/LLVM libraries that were used to build it.
+    # Make sure the linker can find them (e.g., libclang-cpp.so on Debian/Ubuntu).
+    find_program(LLVM_CONFIG_EXE NAMES llvm-config-17 llvm-config-17.0 llvm-config
+        HINTS "$ENV{LLVM_CONFIG_PATH}")
+    if(LLVM_CONFIG_EXE)
+        execute_process(COMMAND ${LLVM_CONFIG_EXE} --libdir
+            OUTPUT_VARIABLE LLVM_LIB_DIR
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        message(STATUS "loomX: LLVM library dir: ${LLVM_LIB_DIR}")
+    endif()
+
     add_executable(loomX
         src/main.cpp
         src/InterproceduralAnalysis.cpp
@@ -82,9 +93,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         src/DivergenceAnalyzer.cpp
         src/ComputeIntensityEstimator.cpp
         src/ReductionDetector.cpp
+        src/LoopDependenceAnalysis.cpp
     )
     target_include_directories(loomX PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(loomX PRIVATE Rose::rose)
+    if(LLVM_LIB_DIR)
+        target_link_directories(loomX PRIVATE ${LLVM_LIB_DIR})
+        list(APPEND CMAKE_INSTALL_RPATH ${LLVM_LIB_DIR})
+    endif()
     set_target_properties(loomX PROPERTIES
         INSTALL_RPATH "${CMAKE_INSTALL_RPATH}"
         BUILD_WITH_INSTALL_RPATH TRUE)
@@ -102,6 +118,7 @@ else()
         src/DivergenceAnalyzer.cpp
         src/ComputeIntensityEstimator.cpp
         src/ReductionDetector.cpp
+        src/LoopDependenceAnalysis.cpp
     )
 
     add_executable(tools_loomX_exe ${tools_loomX_exe_SOURCES})

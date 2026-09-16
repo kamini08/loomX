@@ -56,8 +56,13 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
 
     long iterations = summary.iterationCount;
     bool regular = summary.regularAccess;
+
+    // Mild divergence from function calls or nested loops does not prevent
+    // GPU offloading; nested loops are a common source of GPU parallelism.
+    // Only data-dependent control flow or early exits force CPU execution.
     bool divergent = summary.divergence.isDivergent &&
-                     summary.divergence.kind != loomX::DivergenceKind::FUNCTION_CALL;
+                     summary.divergence.kind != loomX::DivergenceKind::FUNCTION_CALL &&
+                     summary.divergence.kind != loomX::DivergenceKind::INNER_LOOP;
     bool computeHeavy = (summary.intensity.classification == loomX::IntensityClass::COMPUTE_BOUND);
 
     std::cout << "[GpuProfitability] Loop at line "
@@ -66,6 +71,8 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
               << " regular=" << regular
               << " divergent=" << divergent
               << " computeHeavy=" << computeHeavy
+              << " flops=" << summary.intensity.flopCount
+              << " memOps=" << summary.intensity.memoryOpCount
               << " (" << summary.intensity.note << ")"
               << "\n";
 
@@ -81,6 +88,14 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
     }
 
     if (iterations >= 100000 && computeHeavy && regular) {
+        return ParallelTarget::GPU_OFFLOAD;
+    }
+
+    // Heuristic: outer loops that contain nested canonical loops with a large
+    // amount of total floating-point work are good GPU candidates even if the
+    // per-body FLOP/memory ratio looks modest, because the device can exploit
+    // the nested parallelism and amortise data movement.
+    if (regular && hasNestedLoops(loop) && summary.intensity.flopCount >= 1000000) {
         return ParallelTarget::GPU_OFFLOAD;
     }
 
@@ -125,4 +140,13 @@ bool GpuProfitability::hasDivergentControlFlow(SgForStatement* loop) {
 bool GpuProfitability::isComputeIntensive(SgForStatement* loop) {
     loomX::ComputeIntensityResult result = intensityEstimator_.analyze(loop, 8.0);
     return result.classification == loomX::IntensityClass::COMPUTE_BOUND;
+}
+
+bool GpuProfitability::hasNestedLoops(SgForStatement* loop) {
+    if (!loop) return false;
+    SgStatement* body = loop->get_loop_body();
+    if (!body) return false;
+    Rose_STL_Container<SgNode*> nested =
+        NodeQuery::querySubTree(body, V_SgForStatement);
+    return !nested.empty();
 }

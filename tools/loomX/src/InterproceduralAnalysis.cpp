@@ -146,6 +146,13 @@ const FunctionSummary* InterproceduralAnalysis::getSummary(const std::string& fu
 }
 
 bool InterproceduralAnalysis::isSafeForParallelLoop(SgFunctionCallExp* call) const {
+    // Without loop-variable context we cannot prove per-iteration disjoint
+    // pointer writes, so we use the conservative function-level check.
+    return isSafeForParallelLoop(call, nullptr);
+}
+
+bool InterproceduralAnalysis::isSafeForParallelLoop(SgFunctionCallExp* call,
+                                                    SgInitializedName* loopVar) const {
     if (!call) return false;
 
     SgFunctionDeclaration* funcDecl = call->getAssociatedFunctionDeclaration();
@@ -159,7 +166,66 @@ bool InterproceduralAnalysis::isSafeForParallelLoop(SgFunctionCallExp* call) con
     // Whitelisted pure standard library functions are always safe.
     if (isStandardLibraryPureFunction(name)) return true;
 
-    return isFunctionSafe(name);
+    const FunctionSummary* summary = getSummary(name);
+    if (!summary) return false;
+
+    if (!summary->hasDefinition) return false;
+    if (summary->hasTransitiveSideEffects) return false;
+    if (summary->hasGlobalWrites) return false;
+    if (summary->inRecursiveCycle) return false;
+
+    // If there are no pointer writes, the function is safe.
+    if (!summary->writesThroughPointer) return true;
+
+    // Baseline mode: mimic an intraprocedural tool by rejecting all
+    // pointer-parameter writes outright.
+    if (intraproceduralBaseline_) return false;
+
+    // Pointer writes are present. Without a loop variable we must reject.
+    if (!loopVar) return false;
+
+    // Check whether the pointer writes are per-iteration disjoint when this
+    // specific call is placed inside a loop over loopVar.
+    return pointerWritesAreLoopDisjoint(*summary, call, loopVar);
+}
+
+bool InterproceduralAnalysis::pointerWritesAreLoopDisjoint(
+    const FunctionSummary& summary, SgFunctionCallExp* call,
+    SgInitializedName* loopVar) const {
+    if (summary.pointerWritePatterns.empty()) return false;
+
+    SgExprListExp* args = call->get_args();
+    if (!args) return false;
+    std::vector<SgExpression*> argList(args->get_expressions().begin(),
+                                       args->get_expressions().end());
+
+    for (const FunctionSummary::PointerWritePattern& pattern : summary.pointerWritePatterns) {
+        if (pattern.indexParamIdx < 0) {
+            // Index is not a simple scalar parameter; cannot prove disjointness.
+            return false;
+        }
+        if (pattern.indexParamIdx >= static_cast<int>(argList.size())) {
+            return false;
+        }
+
+        SgExpression* arg = argList[pattern.indexParamIdx];
+        SgInitializedName* argVar = getArgumentVariable(arg);
+        if (argVar != loopVar) {
+            // The index argument is not the loop iterator.
+            return false;
+        }
+    }
+
+    return true;
+}
+
+SgInitializedName* InterproceduralAnalysis::getArgumentVariable(SgExpression* expr) const {
+    if (!expr) return nullptr;
+    expr = isSgExpression(skipCasts(expr));
+    if (!expr) return nullptr;
+    SgVarRefExp* varRef = isSgVarRefExp(expr);
+    if (!varRef) return nullptr;
+    return varRef->get_symbol()->get_declaration();
 }
 
 bool InterproceduralAnalysis::isFunctionSafe(const std::string& funcName) const {
@@ -203,6 +269,13 @@ void InterproceduralAnalysis::printSummaries(std::ostream& out) const {
         out << "} pointerWriteParams: {";
         for (int p : s.pointerWriteParams) out << p << " ";
         out << "}\n";
+        if (!s.pointerWritePatterns.empty()) {
+            out << "  pointerWritePatterns: {";
+            for (const auto& pat : s.pointerWritePatterns) {
+                out << "p" << pat.pointerParamIdx << "[p" << pat.indexParamIdx << "] ";
+            }
+            out << "}\n";
+        }
         out << "  callees: {";
         for (const std::string& c : s.callees) out << c << " ";
         out << "}\n";
@@ -367,6 +440,7 @@ void InterproceduralAnalysis::collectParameterAccess(SgFunctionDeclaration* func
     for (SgNode* ref : writeRefs) {
         SgInitializedName* var = nullptr;
         bool isDerefWrite = false;
+        SgExpression* indexExpr = nullptr;
 
         if (SgVarRefExp* varRef = isSgVarRefExp(ref)) {
             var = varRef->get_symbol()->get_declaration();
@@ -375,6 +449,7 @@ void InterproceduralAnalysis::collectParameterAccess(SgFunctionDeclaration* func
             // The whole array reference is reported as a write.
             var = getBaseVariable(arr);
             isDerefWrite = true;
+            indexExpr = arr->get_rhs_operand();
         } else if (SgPointerDerefExp* deref = isSgPointerDerefExp(ref)) {
             var = getBaseVariable(deref);
             isDerefWrite = true;
@@ -389,6 +464,21 @@ void InterproceduralAnalysis::collectParameterAccess(SgFunctionDeclaration* func
         if (isPointerOrArrayType(var->get_type()) && isDerefWrite) {
             summary.pointerWriteParams.insert(idx);
             summary.writesThroughPointer = true;
+
+            // Try to record a simple per-iteration disjoint pattern:
+            // pointer parameter p is written at index given by scalar parameter q.
+            FunctionSummary::PointerWritePattern pattern;
+            pattern.pointerParamIdx = idx;
+            if (indexExpr) {
+                if (SgVarRefExp* idxVarRef = isSgVarRefExp(skipCasts(indexExpr))) {
+                    SgInitializedName* idxVar = idxVarRef->get_symbol()->get_declaration();
+                    int idxParam = paramIndex(idxVar);
+                    if (idxParam >= 0 && !isPointerOrArrayType(idxVar->get_type())) {
+                        pattern.indexParamIdx = idxParam;
+                    }
+                }
+            }
+            summary.pointerWritePatterns.push_back(pattern);
         }
     }
 }
@@ -512,11 +602,14 @@ void InterproceduralAnalysis::dfsSCC(const std::string& node,
 // ---------------------------------------------------------------------------
 
 void InterproceduralAnalysis::propagateSideEffects() {
-    // Initialize: local side effects are already known.
+    // Initialize: local side effects that are unsafe regardless of call site.
+    // Pointer writes with a simple parameter-index pattern may be safe when the
+    // call is inside a loop that passes the loop iterator as that parameter,
+    // so they are not treated as unconditional side effects here.
     for (auto& entry : summaries_) {
         FunctionSummary& s = entry.second;
         s.hasTransitiveSideEffects =
-            s.hasIOSideEffects || s.hasGlobalWrites || s.writesThroughPointer;
+            s.hasIOSideEffects || s.hasGlobalWrites || hasUnanalyzablePointerWrites(s);
     }
 
     // Worklist: start with functions that are locally unsafe.
@@ -590,4 +683,21 @@ SgNode* InterproceduralAnalysis::skipCasts(SgNode* node) const {
         node = cast->get_operand();
     }
     return node;
+}
+
+bool InterproceduralAnalysis::hasUnanalyzablePointerWrites(
+    const FunctionSummary& summary) const {
+    if (!summary.writesThroughPointer) return false;
+
+    // If we detected pointer writes but no patterns, the writes are not
+    // analyzable (e.g., *p = ...).
+    if (summary.pointerWritePatterns.empty()) return true;
+
+    // Any pattern whose index is not a simple scalar parameter is not
+    // analyzable at the call site.
+    for (const FunctionSummary::PointerWritePattern& pattern : summary.pointerWritePatterns) {
+        if (pattern.indexParamIdx < 0) return true;
+    }
+
+    return false;
 }

@@ -5,6 +5,9 @@
 
 namespace loomX {
 
+ComputeIntensityEstimator::ComputeIntensityEstimator()
+    : iterationEstimator_(canonicalChecker_) {}
+
 ComputeIntensityResult ComputeIntensityEstimator::analyze(SgForStatement* loop,
                                                            double targetFLOPsPerMemOp) {
     ComputeIntensityResult result;
@@ -13,7 +16,11 @@ ComputeIntensityResult ComputeIntensityEstimator::analyze(SgForStatement* loop,
         return result;
     }
 
-    countOperations(loop, result.flopCount, result.memoryOpCount,
+    long long tripCount = iterationEstimator_.estimate(loop, false);
+    if (tripCount < 0) tripCount = 1;
+
+    SgStatement* body = loop->get_loop_body();
+    countOperations(body, tripCount, result.flopCount, result.memoryOpCount,
                     result.integerOpCount, result.hasHeavyMath);
 
     if (result.memoryOpCount == 0) {
@@ -46,33 +53,47 @@ ComputeIntensityResult ComputeIntensityEstimator::analyze(SgForStatement* loop,
     return result;
 }
 
-void ComputeIntensityEstimator::countOperations(SgForStatement* loop,
-                                                 int& flops,
-                                                 int& memOps,
-                                                 int& intOps,
-                                                 bool& heavyMath) {
-    flops = 0;
-    memOps = 0;
-    intOps = 0;
-    heavyMath = false;
+static bool isInsideNestedLoop(SgNode* node, SgStatement* enclosingBody) {
+    SgNode* current = node->get_parent();
+    while (current && current != enclosingBody) {
+        if (isSgForStatement(current)) return true;
+        current = current->get_parent();
+    }
+    return false;
+}
 
-    if (!loop) return;
-    SgStatement* body = loop->get_loop_body();
+void ComputeIntensityEstimator::countOperations(SgStatement* body,
+                                                 long long tripCount,
+                                                 long long& flops,
+                                                 long long& memOps,
+                                                 long long& intOps,
+                                                 bool& heavyMath) {
     if (!body) return;
 
     // Memory operations: array references and pointer dereferences.
+    // Skip those that are inside a nested loop; those are handled recursively.
     Rose_STL_Container<SgNode*> arrRefs =
         NodeQuery::querySubTree(body, V_SgPntrArrRefExp);
-    memOps += static_cast<int>(arrRefs.size());
+    for (SgNode* node : arrRefs) {
+        if (!isInsideNestedLoop(node, body)) {
+            memOps += tripCount;
+        }
+    }
 
     Rose_STL_Container<SgNode*> derefRefs =
         NodeQuery::querySubTree(body, V_SgPointerDerefExp);
-    memOps += static_cast<int>(derefRefs.size());
+    for (SgNode* node : derefRefs) {
+        if (!isInsideNestedLoop(node, body)) {
+            memOps += tripCount;
+        }
+    }
 
     // Count binary operations.
     Rose_STL_Container<SgNode*> binOps =
         NodeQuery::querySubTree(body, V_SgBinaryOp);
     for (SgNode* node : binOps) {
+        if (isInsideNestedLoop(node, body)) continue;
+
         SgBinaryOp* binOp = isSgBinaryOp(node);
         if (!binOp) continue;
 
@@ -87,14 +108,14 @@ void ComputeIntensityEstimator::countOperations(SgForStatement* loop,
         }
 
         if (isFloatingPointOp(binOp)) {
-            flops++;
+            flops += tripCount;
         } else if (isSgAddOp(binOp) || isSgSubtractOp(binOp) ||
                    isSgMultiplyOp(binOp) || isSgDivideOp(binOp) ||
                    isSgModOp(binOp) || isSgIntegerDivideOp(binOp) ||
                    isSgBitAndOp(binOp) || isSgBitOrOp(binOp) ||
                    isSgBitXorOp(binOp) || isSgLshiftOp(binOp) ||
                    isSgRshiftOp(binOp)) {
-            intOps++;
+            intOps += tripCount;
         }
     }
 
@@ -102,13 +123,15 @@ void ComputeIntensityEstimator::countOperations(SgForStatement* loop,
     Rose_STL_Container<SgNode*> unaryOps =
         NodeQuery::querySubTree(body, V_SgUnaryOp);
     for (SgNode* node : unaryOps) {
+        if (isInsideNestedLoop(node, body)) continue;
+
         SgUnaryOp* uop = isSgUnaryOp(node);
         if (!uop) continue;
         if (isSgMinusOp(uop) || isSgUnaryAddOp(uop)) {
             if (isFloatingPointType(uop->get_type())) {
-                flops++;
+                flops += tripCount;
             } else {
-                intOps++;
+                intOps += tripCount;
             }
         }
     }
@@ -117,6 +140,8 @@ void ComputeIntensityEstimator::countOperations(SgForStatement* loop,
     Rose_STL_Container<SgNode*> calls =
         NodeQuery::querySubTree(body, V_SgFunctionCallExp);
     for (SgNode* node : calls) {
+        if (isInsideNestedLoop(node, body)) continue;
+
         SgFunctionCallExp* call = isSgFunctionCallExp(node);
         if (!call) continue;
         SgFunctionDeclaration* decl = call->getAssociatedFunctionDeclaration();
@@ -124,8 +149,24 @@ void ComputeIntensityEstimator::countOperations(SgForStatement* loop,
         if (isHeavyMathFunction(decl->get_name().getString())) {
             heavyMath = true;
             // Count each heavy math call as ~8 FLOPs equivalent.
-            flops += 8;
+            flops += 8 * tripCount;
         }
+    }
+
+    // Recurse into nested canonical loops, multiplying their body counts by
+    // their own trip counts so that compute intensity reflects total work.
+    Rose_STL_Container<SgNode*> nestedLoops =
+        NodeQuery::querySubTree(body, V_SgForStatement);
+    for (SgNode* node : nestedLoops) {
+        SgForStatement* nested = isSgForStatement(node);
+        if (!nested) continue;
+
+        long nestedTrip = iterationEstimator_.estimate(nested, false);
+        if (nestedTrip < 0) nestedTrip = 1;
+
+        SgStatement* nestedBody = nested->get_loop_body();
+        countOperations(nestedBody, nestedTrip * tripCount,
+                        flops, memOps, intOps, heavyMath);
     }
 }
 

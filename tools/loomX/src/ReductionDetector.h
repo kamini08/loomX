@@ -23,6 +23,10 @@ private:
     std::string opToString(ReductionOp op);
     bool exprContainsVar(SgExpression* expr, SgInitializedName* var);
     bool isReductionAssignment(SgAssignOp* assign, SgInitializedName*& outVar, ReductionOp& outOp);
+
+    // True if the variable is declared inside the given loop (body or
+    // initializer). Loop-local variables are private, not reductions.
+    bool isLoopLocalVariable(SgInitializedName* var, SgForStatement* loop) const;
 };
 
 } // namespace loomX

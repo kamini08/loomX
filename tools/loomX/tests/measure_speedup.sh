@@ -89,5 +89,6 @@ echo ""
 run_benchmark "perf_large"
 run_benchmark "perf_interproc"
 run_benchmark "perf_compute"
+run_benchmark "polybench_gemm"
 
 echo "=== Measurement complete ==="

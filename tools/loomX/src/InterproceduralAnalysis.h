@@ -35,6 +35,16 @@ struct FunctionSummary {
     std::set<int> pointerReadParams;
     std::set<int> pointerWriteParams;
 
+    // For each pointer-parameter write, record whether the index expression is
+    // exactly another scalar parameter. If so, calls that pass the loop index
+    // as that scalar parameter may be safe because the writes are per-iteration
+    // disjoint.
+    struct PointerWritePattern {
+        int pointerParamIdx = -1;   // Index of the pointer parameter being written
+        int indexParamIdx = -1;     // Index of the scalar parameter used as index (-1 if not)
+    };
+    std::vector<PointerWritePattern> pointerWritePatterns;
+
     // Call graph edges (by function name)
     std::set<std::string> callees;
     std::set<std::string> callers;
@@ -55,11 +65,21 @@ public:
     // Build summaries for all functions in the project.
     void analyzeProject(SgProject* project);
 
+    // When true, reject all pointer-parameter writes (mimics an intraprocedural
+    // baseline). Used for before/after demonstrations.
+    void setIntraproceduralBaseline(bool enabled) {
+        intraproceduralBaseline_ = enabled;
+    }
+
     // Get summary for a function by name.
     const FunctionSummary* getSummary(const std::string& funcName) const;
 
     // Check if a function call is safe to call inside a parallel loop.
+    // The loop-variable overload allows pointer-parameter writes indexed by
+    // the loop iterator to be treated as per-iteration disjoint.
     bool isSafeForParallelLoop(SgFunctionCallExp* call) const;
+    bool isSafeForParallelLoop(SgFunctionCallExp* call,
+                               SgInitializedName* loopVar) const;
 
     // Check if a function (by name) is safe for parallel loops.
     bool isFunctionSafe(const std::string& funcName) const;
@@ -69,6 +89,7 @@ public:
 
 private:
     std::map<std::string, FunctionSummary> summaries_;
+    bool intraproceduralBaseline_ = false;
 
     // Phase 1: local analysis
     void analyzeFunction(SgFunctionDeclaration* funcDecl);
@@ -95,4 +116,18 @@ private:
     bool isStandardLibraryImpureFunction(const std::string& name) const;
     bool isDereferenceWrite(SgNode* ref) const;
     SgNode* skipCasts(SgNode* node) const;
+
+    // For a call argument expression, return the parameter/variable it refers
+    // to after stripping casts, or nullptr if it is not a bare variable.
+    SgInitializedName* getArgumentVariable(SgExpression* expr) const;
+
+    // Check whether every pointer-parameter write in the callee is indexed by
+    // loopVar in this specific call.
+    bool pointerWritesAreLoopDisjoint(const FunctionSummary& summary,
+                                      SgFunctionCallExp* call,
+                                      SgInitializedName* loopVar) const;
+
+    // True if the function has pointer writes that are not simple
+    // parameter-index patterns and are therefore unsafe regardless of call site.
+    bool hasUnanalyzablePointerWrites(const FunctionSummary& summary) const;
 };
