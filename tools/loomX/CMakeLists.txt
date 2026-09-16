@@ -11,37 +11,54 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     if(NOT TARGET Rose::rose)
         message(STATUS "loomX: building standalone against installed ROSE")
 
-        # Allow the user to point to a ROSE install via environment or cache.
-        if(NOT DEFINED ROSE_INSTALL_PREFIX)
+        # The user can point CMake at a ROSE installation explicitly.
+        #   cmake .. -DROSE_INSTALL_PREFIX=/path/to/rose/install
+        # or via the environment:
+        #   ROSE_INSTALL_PREFIX=/path/to/rose/install cmake ..
+        if(NOT DEFINED ROSE_INSTALL_PREFIX OR ROSE_INSTALL_PREFIX STREQUAL "")
             set(ROSE_INSTALL_PREFIX "$ENV{ROSE_INSTALL_PREFIX}")
         endif()
-        if(NOT ROSE_INSTALL_PREFIX)
-            # Try a few common defaults.
-            if(EXISTS "/home/superboy/Downloads/MadhurKumar004/loomX/install/lib/librose.so")
-                set(ROSE_INSTALL_PREFIX "/home/superboy/Downloads/MadhurKumar004/loomX/install")
-            elseif(EXISTS "/usr/local/lib/librose.so")
-                set(ROSE_INSTALL_PREFIX "/usr/local")
-            elseif(EXISTS "/usr/lib/librose.so")
-                set(ROSE_INSTALL_PREFIX "/usr")
-            endif()
-        endif()
-        if(NOT ROSE_INSTALL_PREFIX)
-            message(FATAL_ERROR "Please set ROSE_INSTALL_PREFIX to your ROSE installation directory")
+
+        # If a prefix was given, prefer it for searching.
+        if(ROSE_INSTALL_PREFIX)
+            list(APPEND CMAKE_PREFIX_PATH "${ROSE_INSTALL_PREFIX}")
         endif()
 
-        list(APPEND CMAKE_PREFIX_PATH "${ROSE_INSTALL_PREFIX}")
+        # Try CMake-config mode first (RoseConfig.cmake).
         find_package(Rose QUIET)
 
         if(NOT TARGET Rose::rose)
-            # No RoseConfig.cmake: fall back to manual include/library discovery.
-            message(STATUS "loomX: RoseConfig.cmake not found; using manual ROSE paths")
+            # No RoseConfig.cmake: fall back to manual discovery.
+            message(STATUS "loomX: RoseConfig.cmake not found; using manual ROSE discovery")
+
+            if(ROSE_INSTALL_PREFIX)
+                # Search only in the user-supplied prefix.
+                find_path(ROSE_INCLUDE_DIR rose.h
+                    PATHS "${ROSE_INSTALL_PREFIX}/include/rose"
+                    NO_DEFAULT_PATH
+                    REQUIRED)
+                find_library(ROSE_LIBRARY rose
+                    PATHS "${ROSE_INSTALL_PREFIX}/lib"
+                    NO_DEFAULT_PATH
+                    REQUIRED)
+            else()
+                # Search the system for an installed ROSE.
+                find_path(ROSE_INCLUDE_DIR rose.h
+                    PATH_SUFFIXES rose
+                    REQUIRED)
+                find_library(ROSE_LIBRARY rose REQUIRED)
+            endif()
+
+            message(STATUS "loomX: ROSE include dir: ${ROSE_INCLUDE_DIR}")
+            message(STATUS "loomX: ROSE library:     ${ROSE_LIBRARY}")
+
             add_library(Rose::rose INTERFACE IMPORTED)
-            set(ROSE_INCLUDE_DIRS "${ROSE_INSTALL_PREFIX}/include/rose")
-            find_library(ROSE_LIBRARY rose PATHS "${ROSE_INSTALL_PREFIX}/lib" REQUIRED)
-            target_include_directories(Rose::rose INTERFACE ${ROSE_INCLUDE_DIRS})
+            target_include_directories(Rose::rose INTERFACE ${ROSE_INCLUDE_DIR})
+
             find_package(Boost REQUIRED COMPONENTS
                 date_time thread filesystem program_options regex system
                 serialization wave iostreams chrono atomic)
+
             target_link_libraries(Rose::rose INTERFACE
                 ${ROSE_LIBRARY}
                 Boost::date_time Boost::thread Boost::filesystem Boost::program_options
@@ -50,7 +67,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
                 dl pthread m)
         endif()
 
-        set(CMAKE_INSTALL_RPATH "${ROSE_INSTALL_PREFIX}/lib")
+        # Set rpath so the binary finds librose.so at runtime.
+        get_filename_component(ROSE_LIB_DIR "${ROSE_LIBRARY}" DIRECTORY)
+        set(CMAKE_INSTALL_RPATH "${ROSE_LIB_DIR}")
     endif()
 
     add_executable(loomX
