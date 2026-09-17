@@ -33,6 +33,73 @@ static bool isScalarVariable(SgInitializedName* var) {
     return true;
 }
 
+// Check for loop-carried dependences through scalar variables that are not
+// recognized as reductions.  A scalar declared outside the loop and written
+// inside the loop body is unsafe unless it is a reduction variable or the loop
+// index itself.
+static bool hasScalarLoopCarriedDependence(SgForStatement* loop,
+                                           const loomX::LoopSummary& summary,
+                                           std::string& description) {
+    SgInitializedName* loopVar = SageInterface::getLoopIndexVariable(loop);
+    SgStatement* loopBody = loop->get_loop_body();
+    if (!loopBody) return false;
+
+    std::set<SgInitializedName*> reductionVars = summary.getReductionVariables();
+
+    std::vector<SgNode*> readRefs, writeRefs;
+    SageInterface::collectReadWriteRefs(loopBody, readRefs, writeRefs);
+
+    for (SgNode* ref : writeRefs) {
+        SgVarRefExp* varRef = isSgVarRefExp(ref);
+        if (!varRef) continue;
+        SgInitializedName* var = varRef->get_symbol()->get_declaration();
+        if (!var) continue;
+
+        // Skip loop index variables.
+        if (var == loopVar) continue;
+
+        // Skip nested loop index variables.
+        Rose_STL_Container<SgNode*> nestedLoops =
+            NodeQuery::querySubTree(loopBody, V_SgForStatement);
+        bool isNestedLoopVar = false;
+        for (SgNode* nlNode : nestedLoops) {
+            SgForStatement* nestedLoop = isSgForStatement(nlNode);
+            if (!nestedLoop) continue;
+            SgInitializedName* nestedVar = SageInterface::getLoopIndexVariable(nestedLoop);
+            if (var == nestedVar) {
+                isNestedLoopVar = true;
+                break;
+            }
+        }
+        if (isNestedLoopVar) continue;
+
+        // Skip reduction variables.
+        if (reductionVars.find(var) != reductionVars.end()) continue;
+
+        // Skip variables declared inside the loop body.
+        SgScopeStatement* varScope = var->get_scope();
+        bool declaredInsideLoop = false;
+        SgNode* currentScope = varScope;
+        while (currentScope && !isSgFunctionDefinition(currentScope)) {
+            if (currentScope == loopBody) {
+                declaredInsideLoop = true;
+                break;
+            }
+            currentScope = currentScope->get_parent();
+        }
+        if (declaredInsideLoop) continue;
+
+        // Skip non-scalars (arrays/pointers are handled by array dependence).
+        if (!isScalarVariable(var)) continue;
+
+        description = "loop-carried scalar dependence on " +
+                      var->get_name().getString();
+        return true;
+    }
+
+    return false;
+}
+
 // Fill private-variable information for the summary.
 // Loop-index variables are implicitly private in OpenMP parallel-for and must
 // not be listed when declared in the for-init statement, because the pragma is
@@ -418,6 +485,15 @@ int main(int argc, char* argv[]) {
 
         // Build the full loop summary (analyses + decision + codegen inputs).
         loomX::LoopSummary summary = buildSummary(loop, profitability, ipa, loopVar);
+
+        // Reject loops with scalar loop-carried dependences that are not
+        // recognized reductions.
+        std::string scalarDepDesc;
+        if (hasScalarLoopCarriedDependence(loop, summary, scalarDepDesc)) {
+            std::cout << "  -> Skipped: " << scalarDepDesc << "\n";
+            skipped++;
+            continue;
+        }
 
         // Reject loops with unsafe function calls.
         if (summary.hasFunctionCalls && !summary.allFunctionCallsSafe) {

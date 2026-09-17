@@ -26,32 +26,59 @@ import sys
 import tempfile
 
 
+def strip_existing_pragmas(src_path):
+    """Return a path to a temp file with existing #pragma omp directives removed.
+
+    DataRaceBench files ship with OpenMP pragmas that encode the intended
+    (safe or buggy) semantics. To measure loomX's own safety judgment, we
+    strip those pragmas before analysis and then check whether loomX chooses
+    to re-insert any.
+    """
+    with open(src_path) as f:
+        lines = f.readlines()
+    stripped = [line for line in lines if not line.lstrip().startswith("#pragma omp")]
+    tmp_path = src_path + ".stripped.c"
+    with open(tmp_path, "w") as f:
+        f.writelines(stripped)
+    return tmp_path
+
+
 def run_loomx(loomx_path, src_path, mode="cpu-only"):
-    """Run loomX on src_path and return True if any loop was parallelized.
+    """Run loomX on a stripped src_path and return True if any loop was parallelized.
+
+    Existing #pragma omp directives are removed first so the verdict reflects
+    loomX's own safety judgment, not the presence of pre-existing pragmas.
     Output is written to a temporary directory so stale .loomx.c files do not
     affect later runs or get scanned as DRB sources.
     """
-    with tempfile.TemporaryDirectory() as td:
-        out_path = os.path.join(td, os.path.basename(src_path) + ".loomx.c")
+    stripped_path = strip_existing_pragmas(src_path)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            out_path = os.path.join(td, os.path.basename(src_path) + ".loomx.c")
+            try:
+                subprocess.run(
+                    [loomx_path, f"--{mode}", stripped_path, "-o", out_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=120,
+                    check=False,
+                )
+            except Exception as e:
+                print(f"  [warn] loomX failed on {src_path}: {e}", file=sys.stderr)
+                return False
+
+            if not os.path.exists(out_path):
+                return False
+
+            with open(out_path) as f:
+                content = f.read()
+            # A parallelized loop will contain an OpenMP pragma.
+            return "#pragma omp" in content
+    finally:
         try:
-            subprocess.run(
-                [loomx_path, f"--{mode}", src_path, "-o", out_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=120,
-                check=False,
-            )
-        except Exception as e:
-            print(f"  [warn] loomX failed on {src_path}: {e}", file=sys.stderr)
-            return False
-
-        if not os.path.exists(out_path):
-            return False
-
-        with open(out_path) as f:
-            content = f.read()
-        # A parallelized loop will contain an OpenMP pragma.
-        return "#pragma omp" in content
+            os.remove(stripped_path)
+        except FileNotFoundError:
+            pass
 
 
 def parse_label(filename):

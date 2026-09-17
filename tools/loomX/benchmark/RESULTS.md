@@ -88,19 +88,32 @@ Correctness: stdout-based diff is not meaningful for `-DPOLYBENCH_TIME` kernels;
 
 Mode: `--cpu-only`. Ground truth: `-yes.c` files contain a race and should be rejected; `-no.c` files are race-free and should be accepted.
 
+The evaluation now strips the original `#pragma omp` directives from each DataRaceBench file before running loomX, so the verdict reflects loomX's own safety judgment rather than the presence of pre-existing pragmas. A new scalar loop-carried-dependence check was also added to reject unsafe scalar read-modify-write patterns.
+
+### Original evaluation (pre-existing pragmas left in place)
+
 ```
 Total evaluated: 117
 Correct:         64 (54.7%)
 False positives (accepted a -yes race): 50
 False negatives (rejected a -no safe case): 3
+```
+
+### Revised evaluation (pragmas stripped + scalar dependence check)
+
+```
+Total evaluated: 117
+Correct:         53 (45.3%)
+False positives (accepted a -yes race): 26
+False negatives (rejected a -no safe case): 38
 
 Confusion matrix:
                 accepted  rejected
--yes (unsafe)      50        1
--no  (safe)        63        3
+-yes (unsafe)      26       25
+-no  (safe)        28       38
 ```
 
-The high false-positive count comes from DataRaceBench cases whose original OpenMP constructs (task, sections, simd, ordered, target, etc.) are stripped before running loomX; loomX then sees simple-looking loops and parallelizes cases that are unsafe under the original semantics.
+The false-positive count dropped from **50 to 26** because loomX is no longer credited for pre-existing pragmas and because scalar loop-carried dependences are now rejected. The false-negative count rose because many `-no` cases are safe only under OpenMP constructs (`task`, `sections`, `simd`, `atomic`, `barrier`, etc.) that are removed during stripping; handling those constructs is the next step.
 
 ## 4. What is missing for the full claims
 
