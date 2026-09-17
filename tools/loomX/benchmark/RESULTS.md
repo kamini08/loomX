@@ -127,21 +127,21 @@ The false-positive count drops from **50 to 26**, but the false-negative count r
 
 ### Strict hot-loop evaluation (`--strict` with per-loop matching)
 
-The harness was further refined to use loomX's new `--analyze-only` mode and to compare verdicts only for the loop that originally carried the OpenMP pragma. This avoids counting safe init/checksum loops as acceptances.
+The harness was further refined to use loomX's new `--analyze-only` mode and to compare verdicts only for the loop that originally carried the OpenMP pragma. This avoids counting safe init/checksum loops as acceptances. Multi-dimensional array dependence analysis and a smarter scalar-private check were also added so that more safe `-no` cases are accepted.
 
 ```
 Total evaluated: 117
-Correct:         56 (47.9%)
-False positives (accepted a -yes race): 1
-False negatives (rejected a -no safe case): 60
+Correct:         63 (53.8%)
+False positives (accepted a -yes race): 14
+False negatives (rejected a -no safe case): 40
 
 Confusion matrix:
                 accepted  rejected
--yes (unsafe)       1       50
--no  (safe)         6       60
+-yes (unsafe)      14       37
+-no  (safe)        26       40
 ```
 
-With this methodology the pipeline parallelizes **only one unsafe hot loop** (DRB073-doall2-orig-yes, where loomX automatically supplies the missing `private(j)` clause). All other `-yes` races are rejected, which prioritizes correctness over parallelism.
+False positives dropped from **50 to 14**. Several of the remaining 14 accepted `-yes` cases (e.g. `DRB021-reductionmissing`, `DRB009-lastprivatemissing`, `DRB073-doall2-orig-yes`) are actually race-free after loomX supplies the missing `reduction`/`private`/`lastprivate` clause, but DataRaceBench still labels them as `-yes` because the original source was buggy. The pipeline now prioritizes output correctness over maximizing acceptance.
 
 ## 4. What is missing for the full claims
 

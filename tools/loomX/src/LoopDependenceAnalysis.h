@@ -15,11 +15,13 @@ struct AffineSubscript {
     std::string note;            // Human-readable detail
 };
 
-// A memory reference inside a loop: array base + subscript expression.
+// A memory reference inside a loop: array base + subscript expressions.
+// Multi-dimensional references store one expression per dimension.
 struct ArrayReference {
-    SgInitializedName* baseVariable = nullptr;  // Array/pointer variable
-    SgExpression* subscriptExpr = nullptr;      // Index expression
-    bool isWrite = false;                       // Read or write access
+    SgInitializedName* baseVariable = nullptr;            // Array/pointer variable
+    std::vector<SgExpression*> subscripts;                // Index expressions (outermost first)
+    SgExpression* subscriptExpr = nullptr;                // Legacy: outermost subscript
+    bool isWrite = false;                                 // Read or write access
     std::string note;
 };
 
@@ -54,9 +56,10 @@ private:
     // GCD test for two affine subscripts.
     bool gcdTest(long long c1, long long c2, long long delta) const;
 
-    // Check whether two references to the same array could be loop-carried.
-    bool hasLoopCarriedDependence(const ArrayReference& ref1,
-                                  const ArrayReference& ref2,
+    // Check whether two subscript expressions to the same array dimension
+    // could be loop-carried.
+    bool hasLoopCarriedDependence(SgExpression* sub1,
+                                  SgExpression* sub2,
                                   SgInitializedName* loopVar);
 };
 

@@ -72,13 +72,26 @@ DependenceResult LoopDependenceAnalysis::analyze(SgForStatement* loop) {
             if (refs[i].baseVariable != refs[j].baseVariable) continue;
             if (!refs[i].baseVariable) continue;
 
-            if (hasLoopCarriedDependence(refs[i], refs[j], loopVar)) {
+            // All subscript lists must have the same rank for a precise check.
+            // If ranks differ (e.g. A[i] vs A[i][j]), conservatively assume
+            // dependence.
+            if (refs[i].subscripts.size() != refs[j].subscripts.size()) {
                 result.hasLoopCarriedDependence = true;
-                result.description = "loop-carried dependence detected on " +
+                result.description = "rank mismatch on " +
                                      refs[i].baseVariable->get_name().getString();
-                result.source = refs[i].subscriptExpr ? refs[i].subscriptExpr
-                                                       : refs[j].subscriptExpr;
                 return result;
+            }
+
+            for (size_t d = 0; d < refs[i].subscripts.size(); ++d) {
+                if (hasLoopCarriedDependence(refs[i].subscripts[d],
+                                             refs[j].subscripts[d],
+                                             loopVar)) {
+                    result.hasLoopCarriedDependence = true;
+                    result.description = "loop-carried dependence detected on " +
+                                         refs[i].baseVariable->get_name().getString();
+                    result.source = refs[i].subscripts[d];
+                    return result;
+                }
             }
         }
     }
@@ -86,6 +99,19 @@ DependenceResult LoopDependenceAnalysis::analyze(SgForStatement* loop) {
     result.hasLoopCarriedDependence = false;
     result.description = "no loop-carried dependence detected";
     return result;
+}
+
+// Collect subscript expressions from a possibly multi-dimensional array
+// reference.  Returns indices from leftmost dimension to rightmost.
+static std::vector<SgExpression*> collectSubscripts(SgPntrArrRefExp* arrRef) {
+    std::vector<SgExpression*> subs;
+    while (arrRef) {
+        subs.push_back(arrRef->get_rhs_operand());
+        SgExpression* lhs = arrRef->get_lhs_operand();
+        arrRef = isSgPntrArrRefExp(lhs);
+    }
+    std::reverse(subs.begin(), subs.end());
+    return subs;
 }
 
 std::vector<ArrayReference> LoopDependenceAnalysis::collectArrayReferences(
@@ -110,7 +136,10 @@ std::vector<ArrayReference> LoopDependenceAnalysis::collectArrayReferences(
 
         ArrayReference ref;
         ref.baseVariable = getBaseVariable(arrRef);
-        ref.subscriptExpr = arrRef->get_rhs_operand();
+        ref.subscripts = collectSubscripts(arrRef);
+        if (!ref.subscripts.empty()) {
+            ref.subscriptExpr = ref.subscripts.front();
+        }
         ref.isWrite = isWrite;
         refs.push_back(ref);
     };
@@ -246,10 +275,10 @@ bool LoopDependenceAnalysis::gcdTest(long long c1, long long c2,
 }
 
 bool LoopDependenceAnalysis::hasLoopCarriedDependence(
-    const ArrayReference& ref1, const ArrayReference& ref2,
+    SgExpression* sub1, SgExpression* sub2,
     SgInitializedName* loopVar) {
-    AffineSubscript s1 = extractAffineSubscript(ref1.subscriptExpr, loopVar);
-    AffineSubscript s2 = extractAffineSubscript(ref2.subscriptExpr, loopVar);
+    AffineSubscript s1 = extractAffineSubscript(sub1, loopVar);
+    AffineSubscript s2 = extractAffineSubscript(sub2, loopVar);
 
     if (!s1.isAffine || !s2.isAffine) {
         // Conservative: if we cannot analyse the subscript, assume dependence.

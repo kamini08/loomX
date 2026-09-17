@@ -8,14 +8,21 @@ import tempfile
 
 
 def find_hot_loop_lines(src_path):
-    """Return line numbers of for-loops originally preceded by #pragma omp."""
+    """Return line numbers of for-loops originally preceded by #pragma omp.
+
+    The returned line numbers are adjusted for the stripped file (i.e. after
+    the original #pragma omp lines are removed), so they match the line
+    numbers reported by loomX's --analyze-only mode.
+    """
     hot_lines = []
     with open(src_path) as f:
         lines = f.readlines()
+    pragma_count = 0
     i = 0
     while i < len(lines):
         line = lines[i]
         if line.lstrip().startswith("#pragma omp"):
+            pragma_count += 1
             # Scan forward for the associated for-statement.
             j = i + 1
             while j < len(lines):
@@ -24,7 +31,8 @@ def find_hot_loop_lines(src_path):
                     j += 1
                     continue
                 if cur.startswith("for ") or cur.startswith("for("):
-                    hot_lines.append(j + 1)  # 1-based line number
+                    # Adjust for pragmas removed before this line.
+                    hot_lines.append(j + 1 - pragma_count)
                     break
                 break
             i = j + 1 if j < len(lines) else i + 1

@@ -33,10 +33,24 @@ static bool isScalarVariable(SgInitializedName* var) {
     return true;
 }
 
+// Return the innermost SgStatement that contains the given AST node.
+static SgStatement* getEnclosingStatement(SgNode* node) {
+    while (node && !isSgStatement(node)) {
+        node = node->get_parent();
+    }
+    return isSgStatement(node);
+}
+
 // Check for loop-carried dependences through scalar variables that are not
-// recognized as reductions.  A scalar declared outside the loop and written
-// inside the loop body is unsafe unless it is a reduction variable or the loop
-// index itself.
+// recognized as reductions.
+//
+// A scalar declared outside the loop and written inside the loop body is safe
+// to make private/lastprivate if:
+//   - it has exactly one write statement in the loop body,
+//   - no read of the variable occurs before that write in source order,
+//   - the write statement is not inside a conditional/switch (so it dominates
+//     the rest of the iteration).
+// Otherwise the scalar is treated as carrying a loop-carried dependence.
 static bool hasScalarLoopCarriedDependence(SgForStatement* loop,
                                            const loomX::LoopSummary& summary,
                                            std::string& description) {
@@ -49,6 +63,8 @@ static bool hasScalarLoopCarriedDependence(SgForStatement* loop,
     std::vector<SgNode*> readRefs, writeRefs;
     SageInterface::collectReadWriteRefs(loopBody, readRefs, writeRefs);
 
+    // Group candidate scalar variables by their declaration.
+    std::set<SgInitializedName*> candidateVars;
     for (SgNode* ref : writeRefs) {
         SgVarRefExp* varRef = isSgVarRefExp(ref);
         if (!varRef) continue;
@@ -92,9 +108,82 @@ static bool hasScalarLoopCarriedDependence(SgForStatement* loop,
         // Skip non-scalars (arrays/pointers are handled by array dependence).
         if (!isScalarVariable(var)) continue;
 
-        description = "loop-carried scalar dependence on " +
-                      var->get_name().getString();
-        return true;
+        candidateVars.insert(var);
+    }
+
+    for (SgInitializedName* var : candidateVars) {
+        // Collect all read and write references to this variable, together with
+        // their enclosing statements, in source order.
+        struct Ref {
+            SgNode* node;
+            SgStatement* stmt;
+            bool isWrite;
+        };
+        std::vector<Ref> refs;
+        auto collect = [&](const std::vector<SgNode*>& src, bool isWrite) {
+            for (SgNode* node : src) {
+                SgVarRefExp* varRef = isSgVarRefExp(node);
+                if (!varRef) continue;
+                if (varRef->get_symbol()->get_declaration() != var) continue;
+                SgStatement* stmt = getEnclosingStatement(node);
+                if (!stmt) continue;
+                refs.push_back({node, stmt, isWrite});
+            }
+        };
+        collect(readRefs, false);
+        collect(writeRefs, true);
+
+        std::sort(refs.begin(), refs.end(),
+                  [](const Ref& a, const Ref& b) {
+                      Sg_File_Info* fa = a.stmt->get_file_info();
+                      Sg_File_Info* fb = b.stmt->get_file_info();
+                      if (!fa || !fb) return a.stmt < b.stmt;
+                      if (fa->get_line() != fb->get_line())
+                          return fa->get_line() < fb->get_line();
+                      return fa->get_col() < fb->get_col();
+                  });
+
+        // Find the first write statement.
+        auto firstWriteIt = std::find_if(
+            refs.begin(), refs.end(), [](const Ref& r) { return r.isWrite; });
+        if (firstWriteIt == refs.end()) continue;
+
+        // Any read before the first write means the read may see a value from a
+        // previous iteration.
+        for (auto it = refs.begin(); it != firstWriteIt; ++it) {
+            if (!it->isWrite) {
+                description = "loop-carried scalar dependence on " +
+                              var->get_name().getString();
+                return true;
+            }
+        }
+
+        // Require exactly one write statement. Multiple writes make it hard to
+        // guarantee the variable is iteration-private.
+        std::set<SgStatement*> writeStmts;
+        for (const Ref& r : refs) {
+            if (r.isWrite) writeStmts.insert(r.stmt);
+        }
+        if (writeStmts.size() != 1) {
+            description = "loop-carried scalar dependence on " +
+                          var->get_name().getString();
+            return true;
+        }
+
+        // The write must dominate the iteration: it cannot be inside a
+        // conditional or switch, otherwise a read later in the body could see
+        // a value from a previous iteration.
+        SgStatement* writeStmt = *writeStmts.begin();
+        SgNode* parent = writeStmt->get_parent();
+        while (parent && parent != loopBody) {
+            if (isSgIfStmt(parent) || isSgSwitchStatement(parent) ||
+                isSgConditionalExp(parent)) {
+                description = "loop-carried scalar dependence on " +
+                              var->get_name().getString();
+                return true;
+            }
+            parent = parent->get_parent();
+        }
     }
 
     return false;
