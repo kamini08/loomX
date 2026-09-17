@@ -25,8 +25,13 @@ struct ProfitabilityConfig {
     // Minimum total FLOPs for the nested-loop GPU heuristic.
     long long minNestedFlopForGPU = 1000000;
 
+    // Minimum total FLOPs (flopCount * iterations) for any GPU offload.
+    // This stops trivially large but computationally light loops (e.g. init,
+    // checksum) from going to the GPU.
+    long long minTotalFlopForGPU = 10000000;
+
     // FLOPs per memory-op threshold used by the compute-intensity estimator.
-    double computeBoundThreshold = 8.0;
+    double computeBoundThreshold = 16.0;
 
     // Abstract hardware throughput numbers (relative units). These are not
     // meant to model a specific GPU exactly; they give the cost model a
@@ -39,6 +44,7 @@ struct ProfitabilityConfig {
     double cpuMemoryBandwidth = 20.0;      // GB/s
     double gpuMemoryBandwidth = 500.0;     // GB/s
     double pcieBandwidth = 32.0;           // GB/s
+    double pcieLatency = 5.0;              // microseconds per transfer direction
     double kernelLaunchOverhead = 10.0;    // microseconds
 
     // GPU must be at least this many times faster than CPU to justify offload.

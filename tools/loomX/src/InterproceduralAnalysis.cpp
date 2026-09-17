@@ -1,4 +1,5 @@
 #include "InterproceduralAnalysis.h"
+#include "ComputeIntensityEstimator.h"
 #include <iostream>
 #include <sstream>
 #include <stack>
@@ -102,6 +103,64 @@ static SgInitializedName* getBaseVariable(SgExpression* expr) {
         return getBaseVariable(bin->get_rhs_operand());
     }
     return nullptr;
+}
+
+// Strip casts from an expression tree (free-function variant).
+static SgNode* stripCastsExpr(SgNode* node) {
+    while (SgCastExp* cast = isSgCastExp(node)) {
+        node = cast->get_operand();
+    }
+    return node;
+}
+
+// For a pointer dereference expression used as a write, try to extract the
+// scalar index expression.  Recognises:
+//   *p          -> nullptr (no index, not analysable)
+//   *(p + idx)  -> idx
+//   *(idx + p)  -> idx
+static SgExpression* extractPointerArithmeticIndex(SgExpression* derefOperand,
+                                                   SgInitializedName* baseVar) {
+    if (!derefOperand) return nullptr;
+    derefOperand = isSgExpression(stripCastsExpr(derefOperand));
+    if (!derefOperand) return nullptr;
+
+    if (SgAddOp* add = isSgAddOp(derefOperand)) {
+        SgExpression* lhs = isSgExpression(stripCastsExpr(add->get_lhs_operand()));
+        SgExpression* rhs = isSgExpression(stripCastsExpr(add->get_rhs_operand()));
+        if (!lhs || !rhs) return nullptr;
+
+        SgInitializedName* lhsVar = getBaseVariable(lhs);
+        SgInitializedName* rhsVar = getBaseVariable(rhs);
+
+        if (lhsVar == baseVar && rhsVar != baseVar) return rhs;
+        if (rhsVar == baseVar && lhsVar != baseVar) return lhs;
+    }
+    return nullptr;
+}
+
+// For an array/pointer subscript expression, extract the index part,
+// tolerating a constant offset: arr[idx], arr[idx + c], arr[c + idx],
+// arr[idx - c].
+static SgExpression* extractSubscriptIndex(SgExpression* indexExpr) {
+    if (!indexExpr) return nullptr;
+    indexExpr = isSgExpression(stripCastsExpr(indexExpr));
+    if (!indexExpr) return nullptr;
+
+    if (SgAddOp* add = isSgAddOp(indexExpr)) {
+        SgExpression* lhs = isSgExpression(stripCastsExpr(add->get_lhs_operand()));
+        SgExpression* rhs = isSgExpression(stripCastsExpr(add->get_rhs_operand()));
+        if (!lhs || !rhs) return nullptr;
+
+        bool lhsConst = isSgValueExp(lhs) != nullptr;
+        bool rhsConst = isSgValueExp(rhs) != nullptr;
+        if (lhsConst && !rhsConst) return rhs;
+        if (rhsConst && !lhsConst) return lhs;
+    } else if (SgSubtractOp* sub = isSgSubtractOp(indexExpr)) {
+        SgExpression* lhs = isSgExpression(stripCastsExpr(sub->get_lhs_operand()));
+        SgExpression* rhs = isSgExpression(stripCastsExpr(sub->get_rhs_operand()));
+        if (lhs && rhs && isSgValueExp(rhs) && !isSgValueExp(lhs)) return lhs;
+    }
+    return indexExpr;
 }
 
 // Walk up from a reference and look for an enclosing function definition.
@@ -331,6 +390,16 @@ void InterproceduralAnalysis::analyzeFunction(SgFunctionDeclaration* funcDecl) {
     // Immediate callees and leaf status.
     collectCallees(funcDecl, summary);
 
+    // Local work estimate (FLOPs and memory ops) for the function body.
+    if (def) {
+        loomX::ComputeIntensityEstimator estimator;
+        loomX::ComputeIntensityResult work = estimator.estimateFunctionWork(def);
+        summary.localFlops = work.flopCount;
+        summary.localMemOps = work.memoryOpCount;
+        summary.estimatedFlops = work.flopCount;
+        summary.estimatedMemOps = work.memoryOpCount;
+    }
+
     // Local side effects are any effects visible to the caller.
     summary.hasIOSideEffects = [&]() {
         Rose_STL_Container<SgNode*> calls =
@@ -449,10 +518,11 @@ void InterproceduralAnalysis::collectParameterAccess(SgFunctionDeclaration* func
             // The whole array reference is reported as a write.
             var = getBaseVariable(arr);
             isDerefWrite = true;
-            indexExpr = arr->get_rhs_operand();
+            indexExpr = extractSubscriptIndex(arr->get_rhs_operand());
         } else if (SgPointerDerefExp* deref = isSgPointerDerefExp(ref)) {
             var = getBaseVariable(deref);
             isDerefWrite = true;
+            indexExpr = extractPointerArithmeticIndex(deref->get_operand(), var);
         }
 
         if (!var) continue;
@@ -634,6 +704,47 @@ void InterproceduralAnalysis::propagateSideEffects() {
             if (!callerIt->second.hasTransitiveSideEffects) {
                 callerIt->second.hasTransitiveSideEffects = true;
                 worklist.insert(callerName);
+            }
+        }
+    }
+
+    // Propagate work estimates bottom-up.  Recursive cycles invalidate callee
+    // estimates, so we skip them.
+    for (auto& entry : summaries_) {
+        FunctionSummary& s = entry.second;
+        if (s.inRecursiveCycle) {
+            s.estimatedFlops = -1;
+            s.estimatedMemOps = -1;
+        }
+    }
+
+    // Keep propagating until no work estimate changes.  Recompute each
+    // function's total from its local work plus the current totals of its
+    // callees, so estimates converge to the transitive closure without
+    // double-counting.
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto& entry : summaries_) {
+            FunctionSummary& caller = entry.second;
+            if (caller.inRecursiveCycle) continue;
+
+            long long newFlops = caller.localFlops;
+            long long newMemOps = caller.localMemOps;
+            for (const std::string& calleeName : caller.callees) {
+                auto it = summaries_.find(calleeName);
+                if (it == summaries_.end()) continue;
+                const FunctionSummary& callee = it->second;
+                if (callee.inRecursiveCycle) continue;
+                if (callee.estimatedFlops < 0 || callee.estimatedMemOps < 0) continue;
+                newFlops += callee.estimatedFlops;
+                newMemOps += callee.estimatedMemOps;
+            }
+
+            if (newFlops != caller.estimatedFlops || newMemOps != caller.estimatedMemOps) {
+                caller.estimatedFlops = newFlops;
+                caller.estimatedMemOps = newMemOps;
+                changed = true;
             }
         }
     }

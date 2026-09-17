@@ -210,6 +210,60 @@ loomX::LoopSummary buildSummary(SgForStatement* loop,
         }
     }
 
+    // Add callee work estimates to the loop's intensity.  The local body
+    // analysis does not look inside function calls, so safe leaf/pure callees
+    // would otherwise appear as trivially memory-bound.
+    for (SgNode* node : calls) {
+        SgFunctionCallExp* call = isSgFunctionCallExp(node);
+        if (!call) continue;
+
+        SgFunctionDeclaration* calleeDecl = call->getAssociatedFunctionDeclaration();
+        if (!calleeDecl) continue;
+        const FunctionSummary* callee = ipa.getSummary(calleeDecl->get_name().getString());
+        if (!callee || callee->estimatedFlops < 0) continue;
+
+        // Compute the product of trip counts for all loops enclosing the call
+        // up to and including the target loop.
+        long long tripProduct = 1;
+        SgNode* current = call;
+        while (current && current != loop) {
+            if (SgForStatement* enclosing = isSgForStatement(current)) {
+                long trip = profitability.getIterationEstimator().estimate(enclosing, false);
+                if (trip > 0) tripProduct *= trip;
+            }
+            current = current->get_parent();
+        }
+        // The target loop itself is not visited by the walk above; account for it.
+        long targetTrip = profitability.getIterationEstimator().estimate(loop, false);
+        if (targetTrip > 0) tripProduct *= targetTrip;
+
+        summary.intensity.flopCount += callee->estimatedFlops * tripProduct;
+        summary.intensity.memoryOpCount += callee->estimatedMemOps * tripProduct;
+    }
+
+    // Recompute intensity classification and target decision now that callee
+    // work has been included.  The initial summarize() decided the target
+    // before interprocedural estimates were available.
+    double computeBoundThreshold = profitability.getConfig().computeBoundThreshold;
+    if (summary.intensity.memoryOpCount > 0) {
+        summary.intensity.flopsPerMemoryOp =
+            static_cast<double>(summary.intensity.flopCount) /
+            static_cast<double>(summary.intensity.memoryOpCount);
+        if (summary.intensity.hasHeavyMath ||
+            summary.intensity.flopsPerMemoryOp >= computeBoundThreshold) {
+            summary.intensity.classification = IntensityClass::COMPUTE_BOUND;
+            summary.intensity.note = "High FLOP/memory ratio; compute-bound";
+        } else if (summary.intensity.flopsPerMemoryOp >=
+                   computeBoundThreshold / 4.0) {
+            summary.intensity.classification = IntensityClass::BALANCED;
+            summary.intensity.note = "Balanced compute and memory";
+        } else {
+            summary.intensity.classification = IntensityClass::MEMORY_BOUND;
+            summary.intensity.note = "Low FLOP/memory ratio; memory-bound";
+        }
+    }
+    profitability.reevaluateTarget(summary);
+
     // Fill codegen inputs.
     fillPrivateVars(loop, summary);
     if (summary.target == ParallelTarget::GPU_OFFLOAD) {
@@ -250,6 +304,8 @@ int main(int argc, char* argv[]) {
             config.minGpuSpeedup = std::stod(argv[++i]);
         } else if (arg == "--min-nested-flop" && i + 1 < argc) {
             config.minNestedFlopForGPU = std::stoll(argv[++i]);
+        } else if (arg == "--min-total-flop" && i + 1 < argc) {
+            config.minTotalFlopForGPU = std::stoll(argv[++i]);
         } else if (arg == "--compute-bound-threshold" && i + 1 < argc) {
             config.computeBoundThreshold = std::stod(argv[++i]);
         } else if (arg == "--gpu-compute-efficiency" && i + 1 < argc) {
@@ -274,10 +330,8 @@ int main(int argc, char* argv[]) {
                   << " [-v|--verbose] [--intraprocedural-baseline]"
                   << " [--cpu-only|--gpu-naive|--gpu-profitable]"
                   << " [--min-gpu-speedup <f>] [--min-nested-flop <n>]"
-                  << " [--compute-bound-threshold <f>]"
-                  << " [--gpu-compute-efficiency <f>] [--heavy-math-cost <f>]"
-                  << " [--pcie-factor <f>] [--cpu-cache-reuse <f>]"
-                  << " [--gpu-reduction-overhead <f>] <input.c> [-o output.c]\n";
+                  << " [--min-total-flop <n>] [--compute-bound-threshold <f>]"
+                  << " <input.c> [-o output.c]\n";
         return 1;
     }
 

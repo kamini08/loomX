@@ -80,7 +80,9 @@ double GpuProfitability::estimateCpuTime(const loomX::LoopSummary& summary) cons
     double computeTime = flops / (config_.cpuComputeThroughput * 1e9); // seconds
     double memoryTime = (memBytes * cacheReuse) / (config_.cpuMemoryBandwidth * 1e9);
 
-    return computeTime + memoryTime;
+    // CPU execution overlaps compute and memory when data fits cache; use the
+    // larger of the two rather than their sum.
+    return std::max(computeTime, memoryTime);
 }
 
 double GpuProfitability::estimateDataMovementBytes(const loomX::LoopSummary& summary) const {
@@ -95,41 +97,21 @@ double GpuProfitability::estimateGpuTime(const loomX::LoopSummary& summary) cons
     double memBytes = static_cast<double>(summary.intensity.memoryOpCount) * BYTES_PER_MEM_OP;
     double dataBytes = estimateDataMovementBytes(summary) * config_.pcieTransferFactor;
 
-    long iterations = summary.iterationCount;
-    if (iterations < 0) iterations = config_.defaultIterationsForSymbolicBound;
+    double launchTime = config_.kernelLaunchOverhead * 1e-6; // seconds
+    double computeTime = flops / (config_.gpuComputeThroughput * 1e9);
+    double memoryTime = memBytes / (config_.gpuMemoryBandwidth * 1e9);
 
-    // GPU utilization: small loops cannot fill the device.
-    long totalThreadsNeeded = iterations;
-    long threadsPerSM = config_.gpuWarpsPerSM * config_.gpuThreadsPerWarp;
-    long threadsForFullUtil = config_.gpuSMCount * threadsPerSM;
-    double utilization = std::min(1.0, static_cast<double>(totalThreadsNeeded) /
-                                       static_cast<double>(threadsForFullUtil));
-    // Require at least a few warps per SM to hide latency.
-    utilization = std::max(utilization, 0.05);
+    // PCIe transfer: bandwidth plus a fixed latency in each direction.  For
+    // small loops the latency dominates and keeps them on the CPU.
+    double transferTime = dataBytes / (config_.pcieBandwidth * 1e9) +
+                          2.0 * config_.pcieLatency * 1e-6;
 
-    // Coalescing: unit-stride accesses use full bandwidth; strided/irregular
-    // accesses waste bandwidth.
-    double coalescing = 1.0;
-    if (summary.intensity.accessPattern == AccessPattern::STRIDED) {
-        coalescing = 0.5;
-    } else if (summary.intensity.accessPattern == AccessPattern::IRREGULAR) {
-        coalescing = 0.25;
-    }
+    // On the GPU compute and device memory overlap; data movement does not.
+    return launchTime + transferTime + std::max(computeTime, memoryTime);
+}
 
-    // Heavy math runs at lower effective throughput on the GPU.
-    double effectiveGpuCompute = config_.gpuComputeThroughput * config_.gpuComputeEfficiency;
-    if (summary.intensity.hasHeavyMath) {
-        effectiveGpuCompute /= config_.heavyMathCostFactor;
-    }
-
-    double launchTime = config_.kernelLaunchOverhead * 1e-6;
-    double computeTime = flops / (effectiveGpuCompute * 1e9 * utilization);
-    double memoryTime = memBytes / (config_.gpuMemoryBandwidth * 1e9 * coalescing);
-    double transferTime = dataBytes / (config_.pcieBandwidth * 1e9);
-
-    double reductionTime = summary.reductions.size() * config_.gpuReductionOverhead;
-
-    return launchTime + computeTime + memoryTime + transferTime + reductionTime;
+void GpuProfitability::reevaluateTarget(loomX::LoopSummary& summary) {
+    summary.target = decideTarget(summary);
 }
 
 ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary) {
@@ -154,6 +136,10 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
                              summary.divergence.kind != loomX::DivergenceKind::INNER_LOOP;
     bool computeHeavy = (summary.intensity.classification == loomX::IntensityClass::COMPUTE_BOUND);
 
+    long long totalWork = totalFlops(summary);
+    bool initLoop = isInitializationLoop(summary);
+    bool reductionOnly = isReductionOnlyLoop(summary);
+
     double cpuTime = estimateCpuTime(summary);
     double gpuTime = estimateGpuTime(summary);
     double speedup = (gpuTime > 0.0) ? (cpuTime / gpuTime) : 0.0;
@@ -166,7 +152,9 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
               << " computeHeavy=" << computeHeavy
               << " flops=" << summary.intensity.flopCount
               << " memOps=" << summary.intensity.memoryOpCount
-              << " accessPattern=" << accessPatternName(summary.intensity.accessPattern)
+              << " totalFlops=" << totalWork
+              << " initLoop=" << initLoop
+              << " reductionOnly=" << reductionOnly
               << " cpuTime=" << cpuTime
               << " gpuTime=" << gpuTime
               << " speedup=" << speedup
@@ -184,17 +172,31 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
         return ParallelTarget::SEQUENTIAL;
     }
 
-    // Primary GPU rule: large, compute-bound loop with estimated speedup.
-    if (iterations >= config_.minIterationsForGPU && computeHeavy &&
+    // Gap-1 fix: initialization and reduction-only loops rarely benefit from
+    // GPU offload because they are memory-bound and have little reuse. Force
+    // them to CPU OpenMP (if large enough) or sequential, regardless of the
+    // raw cost-model speedup.
+    if (initLoop || reductionOnly) {
+        if (iterations >= config_.minIterationsForParallel) {
+            return ParallelTarget::CPU_OPENMP;
+        }
+        return ParallelTarget::SEQUENTIAL;
+    }
+
+    // Primary GPU rule: enough total work and estimated speedup.  The cost
+    // model (including data-transfer latency) is what keeps small or memory-
+    // bound loops on the CPU.
+    if (totalWork >= config_.minTotalFlopForGPU &&
         speedup >= config_.minGpuSpeedup) {
         return ParallelTarget::GPU_OFFLOAD;
     }
 
-    // Secondary GPU rule: outer loops with nested canonical loops and enough
-    // total work that the device can exploit the parallelism. Still require a
-    // positive estimated speedup so we do not offload trivially small regions.
-    if (regular && hasNestedLoops(loop) &&
+    // Secondary GPU rule: compute-bound outer loops with nested canonical loops
+    // and enough total work.  This catches kernels whose inner loops dominate
+    // the work but where the outer loop trip count alone is modest.
+    if (computeHeavy && regular && hasNestedLoops(loop) &&
         summary.intensity.flopCount >= config_.minNestedFlopForGPU &&
+        totalWork >= config_.minTotalFlopForGPU &&
         speedup >= config_.minGpuSpeedup) {
         return ParallelTarget::GPU_OFFLOAD;
     }
@@ -204,6 +206,101 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
     }
 
     return ParallelTarget::SEQUENTIAL;
+}
+
+long long GpuProfitability::totalFlops(const loomX::LoopSummary& summary) const {
+    // The intensity estimator already scales flopCount by trip counts when it
+    // can resolve them.  Only scale further when the trip count is unknown.
+    if (summary.iterationCount < 0) {
+        return summary.intensity.flopCount * 100000;
+    }
+    return summary.intensity.flopCount;
+}
+
+bool GpuProfitability::isInitializationLoop(const loomX::LoopSummary& summary) const {
+    // An initialization loop typically has no reductions, touches at least one
+    // array, and the array references are predominantly writes (e.g.
+    // C[i][j] = ... or a[i] = 0).  This distinguishes init loops from compute
+    // loops that read several arrays and write one.
+    if (!summary.reductions.empty()) return false;
+    if (summary.intensity.memoryOpCount == 0) return false;
+
+    SgStatement* body = summary.loop->get_loop_body();
+    if (!body) return false;
+
+    Rose_STL_Container<SgNode*> arrRefs =
+        NodeQuery::querySubTree(body, V_SgPntrArrRefExp);
+    if (arrRefs.empty()) return false;
+
+    // Count how many array references are on the LHS of an assignment.
+    long long writeArrRefs = 0;
+    long long readArrRefs = 0;
+    for (SgNode* node : arrRefs) {
+        SgPntrArrRefExp* arrRef = isSgPntrArrRefExp(node);
+        if (!arrRef) continue;
+
+        // Determine whether this array reference is on the LHS of an
+        // assignment, either directly or through a multi-dimensional wrapper.
+        bool isWrite = isLhsOfAssignment(arrRef);
+        if (!isWrite) {
+            SgNode* parent = arrRef->get_parent();
+            while (parent && !isSgFunctionDefinition(parent)) {
+                if (isLhsOfAssignment(isSgExpression(parent))) {
+                    isWrite = true;
+                    break;
+                }
+                if (!isSgPntrArrRefExp(parent) && !isSgCastExp(parent)) break;
+                parent = parent->get_parent();
+            }
+        }
+
+        if (isWrite) writeArrRefs++;
+        else readArrRefs++;
+    }
+
+    // If all array references are writes and there are no reductions, it is
+    // almost certainly an initialization loop.
+    return writeArrRefs > 0 && readArrRefs == 0;
+}
+
+bool GpuProfitability::isReductionOnlyLoop(const loomX::LoopSummary& summary) const {
+    // A reduction-only loop has at least one reduction, and the only variables
+    // written inside the loop are the reduction variables.  This catches nested
+    // checksum loops like:
+    //   for(i) for(j) sum = sum + a[i][j];
+    if (summary.reductions.empty()) return false;
+
+    SgStatement* body = summary.loop->get_loop_body();
+    if (!body) return false;
+
+    std::set<SgInitializedName*> reductionVars = summary.getReductionVariables();
+
+    std::vector<SgNode*> readRefs, writeRefs;
+    SageInterface::collectReadWriteRefs(body, readRefs, writeRefs);
+
+    // collectReadWriteRefs also returns loop-index variables (they are
+    // assigned in the for-header).  Exclude them from the write-set check.
+    std::set<SgInitializedName*> loopIndexVars;
+    Rose_STL_Container<SgNode*> forLoops =
+        NodeQuery::querySubTree(body, V_SgForStatement);
+    for (SgNode* node : forLoops) {
+        SgForStatement* forStmt = isSgForStatement(node);
+        SgInitializedName* index = SageInterface::getLoopIndexVariable(forStmt);
+        if (index) loopIndexVars.insert(index);
+    }
+
+    for (SgNode* ref : writeRefs) {
+        SgVarRefExp* varRef = isSgVarRefExp(ref);
+        if (!varRef) continue;
+        SgInitializedName* var = varRef->get_symbol()->get_declaration();
+        if (!var) continue;
+        if (loopIndexVars.find(var) != loopIndexVars.end()) continue;
+        if (reductionVars.find(var) == reductionVars.end()) {
+            return false;  // A non-reduction variable is written.
+        }
+    }
+
+    return true;
 }
 
 long GpuProfitability::estimateIterationCount(SgForStatement* loop) {
