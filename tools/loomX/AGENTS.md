@@ -28,6 +28,7 @@ The binary is named `loomX`. At runtime it needs `librose.so` and Clang/LLVM lib
 ./loomX --cpu-only       input.c -o out.c   # CPU OpenMP for all safe loops
 ./loomX --gpu-naive      input.c -o out.c   # offload everything safe (ablation)
 ./loomX --gpu-profitable input.c -o out.c   # default: profitability gate chooses CPU vs GPU
+./loomX --no-scalar-dep-check input.c -o out.c  # disable scalar loop-carried-dependence guard
 ./loomX -v input.c                           # verbose analysis output
 ```
 
@@ -75,7 +76,7 @@ The driver emits four configs per benchmark: `seq`, `cpu_omp`, `gpu_naive`, `gpu
 - **GPU offload compiler**: GPU configs require a clang built with `openmp` and `libomptarget-nvptarget` support. If `clang -fopenmp -fopenmp-targets=nvptx64-nvidia-cuda` fails with "no library 'libomptarget-nvptx.bc' found", GPU configs are skipped gracefully. See `benchmark/build_gpu_clang.md`.
 - **GPU architecture**: `run_benchmarks.sh` auto-detects from `nvidia-smi`. Override with `GPU_ARCH=sm_80` if the detected arch is unsupported by your CUDA/clang combination (e.g. sm_120 on CUDA 12.4).
 - **Clock locking**: Set `LOCK_CLOCKS=yes` when benchmarking for reproducible timing. Requires root for `nvidia-smi -lgc`.
-- **DataRaceBench evaluation**: `check_dataracebench.py` judges acceptance by checking whether the generated source contains `#pragma omp`, not via a dedicated `--analyze-only` mode. It reports false positives (accepted a `-yes` race) and false negatives (rejected a `-no` safe case).
+- **DataRaceBench evaluation**: `check_dataracebench.py` judges acceptance by checking whether the generated source contains `#pragma omp`. Use `--strict` to strip input pragmas and enable the scalar-dependence guard; the default lenient mode leaves pragmas in place. It reports false positives (accepted a `-yes` race) and false negatives (rejected a `-no` safe case).
 - **Reporting convention**: report full end-to-end wall clock (median of ≥10 runs), geometric mean across benchmarks, and failure/regression counts from `failures.csv`. Do not report kernel-only time or arithmetic mean.
 - **Interprocedural micro-benchmarks** are included in `benchmark/interproc-microbench/`; PolyBench/Rodinia/DataRaceBench are fetched by `setup_benchmarks.sh`.
 

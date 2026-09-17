@@ -88,18 +88,28 @@ Correctness: stdout-based diff is not meaningful for `-DPOLYBENCH_TIME` kernels;
 
 Mode: `--cpu-only`. Ground truth: `-yes.c` files contain a race and should be rejected; `-no.c` files are race-free and should be accepted.
 
-The evaluation now strips the original `#pragma omp` directives from each DataRaceBench file before running loomX, so the verdict reflects loomX's own safety judgment rather than the presence of pre-existing pragmas. A new scalar loop-carried-dependence check was also added to reject unsafe scalar read-modify-write patterns.
+`check_dataracebench.py` now supports two evaluation modes:
 
-### Original evaluation (pre-existing pragmas left in place)
+- **Lenient (default)**: keeps the original `#pragma omp` pragmas in place and disables the scalar-dependence guard. This measures how much of the DataRaceBench corpus loomX leaves parallelized.
+- **Strict (`--strict`)**: strips the original pragmas and enables the scalar-dependence guard. This measures loomX's own safety judgment.
+
+### Lenient evaluation (default)
 
 ```
 Total evaluated: 117
 Correct:         64 (54.7%)
 False positives (accepted a -yes race): 50
 False negatives (rejected a -no safe case): 3
+
+Confusion matrix:
+                accepted  rejected
+-yes (unsafe)      50        1
+-no  (safe)        63        3
 ```
 
-### Revised evaluation (pragmas stripped + scalar dependence check)
+Most `-no` cases are accepted because the original (correct) pragmas remain in the file.
+
+### Strict evaluation (`--strict`)
 
 ```
 Total evaluated: 117
@@ -113,7 +123,7 @@ Confusion matrix:
 -no  (safe)        28       38
 ```
 
-The false-positive count dropped from **50 to 26** because loomX is no longer credited for pre-existing pragmas and because scalar loop-carried dependences are now rejected. The false-negative count rose because many `-no` cases are safe only under OpenMP constructs (`task`, `sections`, `simd`, `atomic`, `barrier`, etc.) that are removed during stripping; handling those constructs is the next step.
+The false-positive count drops from **50 to 26**, but the false-negative count rises because many `-no` cases are safe only under OpenMP constructs (`task`, `sections`, `simd`, `atomic`, `barrier`, etc.) that are removed during stripping; handling those constructs is the next step.
 
 ## 4. What is missing for the full claims
 

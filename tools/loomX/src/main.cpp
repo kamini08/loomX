@@ -351,6 +351,7 @@ int main(int argc, char* argv[]) {
 
     bool verbose = false;
     bool intraproceduralBaseline = false;
+    bool scalarDepCheck = true;
     TranslationMode mode = TranslationMode::GPU_PROFITABLE;
     loomX::ProfitabilityConfig config;
     std::string explicitOutputFile;
@@ -361,6 +362,8 @@ int main(int argc, char* argv[]) {
             verbose = true;
         } else if (arg == "--intraprocedural-baseline") {
             intraproceduralBaseline = true;
+        } else if (arg == "--no-scalar-dep-check") {
+            scalarDepCheck = false;
         } else if (arg == "--cpu-only") {
             mode = TranslationMode::CPU_ONLY;
         } else if (arg == "--gpu-naive") {
@@ -394,7 +397,7 @@ int main(int argc, char* argv[]) {
 
     if (args.empty()) {
         std::cerr << "Usage: " << argv[0]
-                  << " [-v|--verbose] [--intraprocedural-baseline]"
+                  << " [-v|--verbose] [--intraprocedural-baseline] [--no-scalar-dep-check]"
                   << " [--cpu-only|--gpu-naive|--gpu-profitable]"
                   << " [--min-gpu-speedup <f>] [--min-nested-flop <n>]"
                   << " [--min-total-flop <n>] [--compute-bound-threshold <f>]"
@@ -487,12 +490,14 @@ int main(int argc, char* argv[]) {
         loomX::LoopSummary summary = buildSummary(loop, profitability, ipa, loopVar);
 
         // Reject loops with scalar loop-carried dependences that are not
-        // recognized reductions.
-        std::string scalarDepDesc;
-        if (hasScalarLoopCarriedDependence(loop, summary, scalarDepDesc)) {
-            std::cout << "  -> Skipped: " << scalarDepDesc << "\n";
-            skipped++;
-            continue;
+        // recognized reductions (unless disabled for lenient evaluation).
+        if (scalarDepCheck) {
+            std::string scalarDepDesc;
+            if (hasScalarLoopCarriedDependence(loop, summary, scalarDepDesc)) {
+                std::cout << "  -> Skipped: " << scalarDepDesc << "\n";
+                skipped++;
+                continue;
+            }
         }
 
         // Reject loops with unsafe function calls.

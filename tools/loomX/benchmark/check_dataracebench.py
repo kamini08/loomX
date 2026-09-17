@@ -43,21 +43,31 @@ def strip_existing_pragmas(src_path):
     return tmp_path
 
 
-def run_loomx(loomx_path, src_path, mode="cpu-only"):
-    """Run loomX on a stripped src_path and return True if any loop was parallelized.
+def run_loomx(loomx_path, src_path, mode="cpu-only", strict=False):
+    """Run loomX on src_path and return True if any loop was parallelized.
 
-    Existing #pragma omp directives are removed first so the verdict reflects
-    loomX's own safety judgment, not the presence of pre-existing pragmas.
+    In strict mode, existing #pragma omp directives are removed first so the
+    verdict reflects loomX's own safety judgment.  In lenient mode (default),
+    the original pragmas are left in place and the scalar-dependence guard is
+    disabled, giving a higher acceptance rate at the cost of more false
+    positives from pre-existing buggy pragmas.
+
     Output is written to a temporary directory so stale .loomx.c files do not
     affect later runs or get scanned as DRB sources.
     """
-    stripped_path = strip_existing_pragmas(src_path)
+    input_path = src_path
+    extra_args = []
+    if strict:
+        input_path = strip_existing_pragmas(src_path)
+    else:
+        extra_args.append("--no-scalar-dep-check")
+
     try:
         with tempfile.TemporaryDirectory() as td:
             out_path = os.path.join(td, os.path.basename(src_path) + ".loomx.c")
             try:
                 subprocess.run(
-                    [loomx_path, f"--{mode}", stripped_path, "-o", out_path],
+                    [loomx_path, f"--{mode}"] + extra_args + [input_path, "-o", out_path],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     timeout=120,
@@ -75,10 +85,11 @@ def run_loomx(loomx_path, src_path, mode="cpu-only"):
             # A parallelized loop will contain an OpenMP pragma.
             return "#pragma omp" in content
     finally:
-        try:
-            os.remove(stripped_path)
-        except FileNotFoundError:
-            pass
+        if strict:
+            try:
+                os.remove(input_path)
+            except FileNotFoundError:
+                pass
 
 
 def parse_label(filename):
@@ -94,6 +105,7 @@ def main():
     ap.add_argument("--loomx", required=True, help="path to loomX translator")
     ap.add_argument("--suite", required=True, help="path to dataracebench micro-benchmarks dir")
     ap.add_argument("--mode", default="cpu-only", help="loomX mode: cpu-only, gpu-naive, gpu-profitable")
+    ap.add_argument("--strict", action="store_true", help="strip input pragmas and enable scalar-dependence guard")
     ap.add_argument("--output", default="dataracebench_results.csv")
     args = ap.parse_args()
 
@@ -112,7 +124,7 @@ def main():
             continue
 
         src = os.path.join(args.suite, filename)
-        parallelized = run_loomx(args.loomx, src, args.mode)
+        parallelized = run_loomx(args.loomx, src, args.mode, strict=args.strict)
 
         if parallelized:
             accepted[label] += 1
