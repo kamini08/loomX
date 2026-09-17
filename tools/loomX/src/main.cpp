@@ -224,6 +224,7 @@ int main(int argc, char* argv[]) {
 
     bool verbose = false;
     bool intraproceduralBaseline = false;
+    loomX::ProfitabilityConfig config;
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
@@ -231,13 +232,22 @@ int main(int argc, char* argv[]) {
             verbose = true;
         } else if (arg == "--intraprocedural-baseline") {
             intraproceduralBaseline = true;
+        } else if (arg == "--min-gpu-speedup" && i + 1 < argc) {
+            config.minGpuSpeedup = std::stod(argv[++i]);
+        } else if (arg == "--min-nested-flop" && i + 1 < argc) {
+            config.minNestedFlopForGPU = std::stoll(argv[++i]);
+        } else if (arg == "--compute-bound-threshold" && i + 1 < argc) {
+            config.computeBoundThreshold = std::stod(argv[++i]);
         } else {
             args.push_back(arg);
         }
     }
 
     if (args.empty()) {
-        std::cerr << "Usage: " << argv[0] << " [-v|--verbose] <input.c> [-o output.c]\n";
+        std::cerr << "Usage: " << argv[0]
+                  << " [-v|--verbose] [--intraprocedural-baseline]"
+                  << " [--min-gpu-speedup <f>] [--min-nested-flop <n>]"
+                  << " [--compute-bound-threshold <f>] <input.c> [-o output.c]\n";
         return 1;
     }
 
@@ -272,7 +282,7 @@ int main(int argc, char* argv[]) {
 
     // Step 3: Analyze and transform each loop
     std::cout << "\n=== Phase 3: Parallelization ===\n";
-    GpuProfitability profitability;
+    GpuProfitability profitability(config);
     OpenMPCodeGen codegen;
 
     int parallelized = 0;

@@ -2,11 +2,23 @@
 #include "LoopAnalysisUtil.h"
 #include "ReductionDetector.h"
 #include <iostream>
+#include <algorithm>
 
 using namespace loomX;
 
+namespace {
+
+// Convert a memory-op count into an approximate byte count. We assume
+// double-precision (8 bytes) per access; this can be made type-aware later.
+constexpr double BYTES_PER_MEM_OP = 8.0;
+
+} // namespace
+
 GpuProfitability::GpuProfitability()
     : iterationEstimator_(canonicalChecker_) {}
+
+GpuProfitability::GpuProfitability(const loomX::ProfitabilityConfig& config)
+    : iterationEstimator_(canonicalChecker_), config_(config) {}
 
 ParallelTarget GpuProfitability::classifyLoop(SgForStatement* loop) {
     return summarize(loop).target;
@@ -31,7 +43,7 @@ loomX::LoopSummary GpuProfitability::summarize(SgForStatement* loop) {
     summary.divergence = divergenceAnalyzer_.analyze(loop);
 
     // 5. Compute intensity.
-    summary.intensity = intensityEstimator_.analyze(loop, 8.0);
+    summary.intensity = intensityEstimator_.analyze(loop, config_.computeBoundThreshold);
 
     // 6. Reductions.
     ReductionDetector reducer;
@@ -41,6 +53,37 @@ loomX::LoopSummary GpuProfitability::summarize(SgForStatement* loop) {
     summary.target = decideTarget(summary);
 
     return summary;
+}
+
+double GpuProfitability::estimateCpuTime(const loomX::LoopSummary& summary) const {
+    double flops = static_cast<double>(summary.intensity.flopCount);
+    double memBytes = static_cast<double>(summary.intensity.memoryOpCount) * BYTES_PER_MEM_OP;
+
+    double computeTime = flops / (config_.cpuComputeThroughput * 1e9); // seconds
+    double memoryTime = memBytes / (config_.cpuMemoryBandwidth * 1e9); // seconds
+
+    // CPU can often reuse cache, so memory time is an upper bound.
+    return computeTime + memoryTime;
+}
+
+double GpuProfitability::estimateDataMovementBytes(const loomX::LoopSummary& summary) const {
+    // Approximate data movement as the bytes touched by memory operations.
+    // With target-data hoisting this is pessimistic for secondary loops, but
+    // it correctly penalises loops that touch a lot of data relative to work.
+    return static_cast<double>(summary.intensity.memoryOpCount) * BYTES_PER_MEM_OP;
+}
+
+double GpuProfitability::estimateGpuTime(const loomX::LoopSummary& summary) const {
+    double flops = static_cast<double>(summary.intensity.flopCount);
+    double memBytes = static_cast<double>(summary.intensity.memoryOpCount) * BYTES_PER_MEM_OP;
+    double dataBytes = estimateDataMovementBytes(summary);
+
+    double launchTime = config_.kernelLaunchOverhead * 1e-6; // seconds
+    double computeTime = flops / (config_.gpuComputeThroughput * 1e9);
+    double memoryTime = memBytes / (config_.gpuMemoryBandwidth * 1e9);
+    double transferTime = dataBytes / (config_.pcieBandwidth * 1e9);
+
+    return launchTime + computeTime + memoryTime + transferTime;
 }
 
 ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary) {
@@ -60,46 +103,56 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
     // Mild divergence from function calls or nested loops does not prevent
     // GPU offloading; nested loops are a common source of GPU parallelism.
     // Only data-dependent control flow or early exits force CPU execution.
-    bool divergent = summary.divergence.isDivergent &&
-                     summary.divergence.kind != loomX::DivergenceKind::FUNCTION_CALL &&
-                     summary.divergence.kind != loomX::DivergenceKind::INNER_LOOP;
+    bool stronglyDivergent = summary.divergence.isDivergent &&
+                             summary.divergence.kind != loomX::DivergenceKind::FUNCTION_CALL &&
+                             summary.divergence.kind != loomX::DivergenceKind::INNER_LOOP;
     bool computeHeavy = (summary.intensity.classification == loomX::IntensityClass::COMPUTE_BOUND);
+
+    double cpuTime = estimateCpuTime(summary);
+    double gpuTime = estimateGpuTime(summary);
+    double speedup = (gpuTime > 0.0) ? (cpuTime / gpuTime) : 0.0;
 
     std::cout << "[GpuProfitability] Loop at line "
               << loop->get_file_info()->get_line()
               << " iterations=" << iterations
               << " regular=" << regular
-              << " divergent=" << divergent
+              << " divergent=" << stronglyDivergent
               << " computeHeavy=" << computeHeavy
               << " flops=" << summary.intensity.flopCount
               << " memOps=" << summary.intensity.memoryOpCount
+              << " cpuTime=" << cpuTime
+              << " gpuTime=" << gpuTime
+              << " speedup=" << speedup
               << " (" << summary.intensity.note << ")"
               << "\n";
 
-    if (iterations >= 0 && iterations < 100) {
+    if (iterations >= 0 && iterations < config_.minIterationsForParallel) {
         return ParallelTarget::SEQUENTIAL;
     }
 
-    if (!regular || divergent) {
-        if (iterations >= 1000) {
+    if (!regular || stronglyDivergent) {
+        if (iterations >= config_.minIterationsForCPU) {
             return ParallelTarget::CPU_OPENMP;
         }
         return ParallelTarget::SEQUENTIAL;
     }
 
-    if (iterations >= 100000 && computeHeavy && regular) {
+    // Primary GPU rule: large, compute-bound loop with estimated speedup.
+    if (iterations >= config_.minIterationsForGPU && computeHeavy &&
+        speedup >= config_.minGpuSpeedup) {
         return ParallelTarget::GPU_OFFLOAD;
     }
 
-    // Heuristic: outer loops that contain nested canonical loops with a large
-    // amount of total floating-point work are good GPU candidates even if the
-    // per-body FLOP/memory ratio looks modest, because the device can exploit
-    // the nested parallelism and amortise data movement.
-    if (regular && hasNestedLoops(loop) && summary.intensity.flopCount >= 1000000) {
+    // Secondary GPU rule: outer loops with nested canonical loops and enough
+    // total work that the device can exploit the parallelism. Still require a
+    // positive estimated speedup so we do not offload trivially small regions.
+    if (regular && hasNestedLoops(loop) &&
+        summary.intensity.flopCount >= config_.minNestedFlopForGPU &&
+        speedup >= config_.minGpuSpeedup) {
         return ParallelTarget::GPU_OFFLOAD;
     }
 
-    if (iterations >= 100) {
+    if (iterations >= config_.minIterationsForParallel) {
         return ParallelTarget::CPU_OPENMP;
     }
 

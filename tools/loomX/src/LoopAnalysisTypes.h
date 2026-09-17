@@ -7,6 +7,40 @@ namespace loomX {
 // Target for parallelized loop.
 enum class ParallelTarget { SEQUENTIAL, CPU_OPENMP, GPU_OFFLOAD };
 
+// Tunable parameters for the GPU profitability cost model.
+struct ProfitabilityConfig {
+    // Minimum iterations to consider any parallelization.
+    long minIterationsForParallel = 100;
+
+    // Minimum iterations for GPU offload (when compute-bound).
+    long minIterationsForGPU = 100000;
+
+    // Minimum iterations for CPU OpenMP when loop is irregular/divergent.
+    long minIterationsForCPU = 1000;
+
+    // Minimum total FLOPs for the nested-loop GPU heuristic.
+    long long minNestedFlopForGPU = 1000000;
+
+    // FLOPs per memory-op threshold used by the compute-intensity estimator.
+    double computeBoundThreshold = 8.0;
+
+    // Abstract hardware throughput numbers (relative units). These are not
+    // meant to model a specific GPU exactly; they give the cost model a
+    // consistent shape so decisions improve as the loop gets larger or more
+    // compute-intensive.
+    // Defaults are tuned so that large compute-bound kernels (e.g. PolyBench
+    // gemm) favour GPU offload while small or memory-bound loops stay on CPU.
+    double cpuComputeThroughput = 5.0;     // GFLOP/s (scalar, single-thread)
+    double gpuComputeThroughput = 5000.0;  // GFLOP/s
+    double cpuMemoryBandwidth = 20.0;      // GB/s
+    double gpuMemoryBandwidth = 500.0;     // GB/s
+    double pcieBandwidth = 32.0;           // GB/s
+    double kernelLaunchOverhead = 10.0;    // microseconds
+
+    // GPU must be at least this many times faster than CPU to justify offload.
+    double minGpuSpeedup = 1.2;
+};
+
 // Canonical form classification for a for-loop.
 enum class CanonicalForm {
     UNKNOWN,        // Not analyzed yet
