@@ -328,6 +328,15 @@ void OpenMPCodeGen::hoistTargetDataRegions(std::string& source) {
             mappedVars.insert(vars.begin(), vars.end());
         }
 
+        // If no variables are mapped, hoisting a target data region is pointless
+        // and produces an invalid empty map clause. Leave the loops as-is.
+        if (mappedVars.empty()) {
+            size_t end = pairs.back().second;
+            result.append(source, pos, end - pos);
+            pos = end;
+            continue;
+        }
+
         // Emit target data pragma.
         result += "#pragma omp target data " + buildTargetDataMapClause(mappedVars) + "\n{\n";
 
@@ -378,6 +387,7 @@ std::set<std::string> OpenMPCodeGen::collectMappedVars(const std::string& pragma
 
 std::string OpenMPCodeGen::buildTargetDataMapClause(
     const std::set<std::string>& mappedVars) {
+    if (mappedVars.empty()) return "";
     std::ostringstream oss;
     oss << "map(tofrom:";
     bool first = true;

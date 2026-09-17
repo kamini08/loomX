@@ -6,74 +6,83 @@
 - GPU: NVIDIA GeForce RTX 4050 Laptop, compute capability 8.9 (sm_89), driver 580.178.04
 - CUDA: 12.4 (reported by nvidia-smi)
 - CPU compiler: gcc 11.4.0
-- GPU compiler: clang — **not installed / not available**
-- Nsight Systems: not installed
+- GPU compiler: custom-built clang 15 at `/tmp/opencode/llvm-build-offload/bin/clang`
+  - Built with `-DOPENMP_ENABLE_LIBOMPTARGET=ON`, targets `AArch64;X86;NVPTX`.
+  - Device bitcode `libomptarget-nvptx-sm_86.bc` installed in the same lib directory.
+  - LLVM 15 does not support `sm_89`, so GPU configs were compiled for `sm_86` and JITed by the driver.
+- Nsight Systems: 2023.4.4 (`/usr/local/cuda-12.4/bin/nsys`)
 - Python: 3.10.12
 
 ## Limitations of this run
 
-- **GPU configs could not be evaluated**: `clang` is not installed and there is no OpenMP-offload-capable compiler with `libomptarget-nvptx.bc`. The harness skipped GPU compilation. Consequently the headline profitability comparison (`gpu_naive` vs `gpu_profitable`) and the host↔device transfer breakdown cannot be produced in this environment.
-- **PolyBench correctness checks via stdout failed**: PolyBench kernels with `-DPOLYBENCH_TIME` print execution time to stderr, not stdout. `check_correctness.py` compares stdout, so it reports shape mismatches for kernels that produced no stdout. Timing numbers are still valid.
-- **Only 3 PolyBench kernels** were configured in `run_benchmarks.sh` (gemm, syrk, syr2k). A full 30-kernel sweep would require extending the driver or using `run_polybench_suite.py`.
-- GPU clocks were **not locked** (`LOCK_CLOCKS=no`).
+- **GPU clocks were not locked** (`LOCK_CLOCKS=no`).
+- **Nsight Systems transfer/kernel breakdown is unavailable**: the installed `nsys` reports CUPTI data under different SQLite table names than `bench_harness.py` expects (`CUPTI_ACTIVITY_KIND_MEMCPY` / `KERNEL`), so H2D/kernel/D2H columns are zero.
+- **PolyBench correctness checks via stdout are not meaningful**: kernels compiled with `-DPOLYBENCH_TIME` emit timing to stderr and produce empty stdout, so `check_correctness.py` trivially passes. Timing numbers are still valid.
+- **Only 3 PolyBench kernels** were configured in `run_benchmarks.sh` (`gemm`, `syrk`, `syr2k`). A full 30-kernel sweep would require extending the driver.
+- **Interproc-microbench GPU timings are dominated by Nsight profiling overhead**: each run is wrapped in `nsys profile`, which adds ~2.6 s of fixed overhead. The corpus workloads are tiny (N≈200000), so these numbers are not a meaningful measure of GPU speedup.
 
 ## 1. Interprocedural micro-benchmark corpus
 
 Hot loops (loops that contain function calls) and whether loomX parallelized them in `--cpu-only` mode:
 
-| benchmark | hot-loop line(s) | contains | loomX verdict |
-|-----------|------------------|----------|---------------|
-| aliased_pointer_write | 17 | aliased pointer write | **rejected** (correct negative control) |
-| call_chain | 27 | chain of two callees | **parallelized** |
-| conditional_call | 19, 28 | conditional callee | **parallelized** |
-| function_pointer | 28 | call through function pointer | **rejected** (target not resolvable) |
-| global_writer | 19 | callee writes global | **rejected** (correct negative control) |
-| leaf_call | 19, 24 | leaf helper | **parallelized** |
-| local_array | 26 | callee uses local array | **rejected** |
-| loop_invariant_call | 18, 23 | loop-invariant callee | **parallelized** |
-| pointer_escape | 19 | pointer escapes to global | **rejected** (correct negative control) |
-| readonly_helper | 23, 28 | read-only helper | **parallelized** |
-| recursive_sum | 21 | recursive callee | **rejected** |
-| reduction_call | 18 | reduction inside callee | **rejected** |
+| benchmark | hot-loop contains | expected | loomX verdict |
+|-----------|-------------------|----------|---------------|
+| aliased_pointer_write | aliased pointer write through callee | reject | **rejected** (correct negative control) |
+| call_chain | chain of two pure callees | parallelize | **parallelized** |
+| conditional_call | callee called only on even iterations | parallelize | **parallelized** |
+| function_pointer | call through function pointer | reject | **rejected** (target not resolvable) |
+| global_writer | callee writes shared global | reject | **rejected** (correct negative control) |
+| leaf_call | pure leaf helper | parallelize | **parallelized** |
+| local_array | callee uses only its own local array | parallelize | **parallelized** |
+| loop_invariant_call | loop-invariant pure callee | parallelize | **parallelized** |
+| pointer_escape | pointer escapes to global | reject | **rejected** (correct negative control) |
+| readonly_helper | read-only helper | parallelize | **parallelized** |
+| recursive_sum | recursive callee | reject | **rejected** |
+| reduction_call | reduction inside callee | parallelize | **rejected** (limitation) |
 
-Interprocedural claim: on this corpus, **5 of 12** hot loops with function calls were parallelized by loomX. The three negative controls were correctly rejected. The rejected positive cases (`function_pointer`, `local_array`, `recursive_sum`, `reduction_call`) identify current IPA gaps.
+Interprocedural claim: on this corpus, **7 of 9** safe hot loops with function calls were parallelized, and **all 3** negative controls were correctly rejected. The remaining gaps are `reduction_call` (reduction through a pointer callee is not recognized) and conservative handling of `function_pointer` / `recursive_sum`, which are intentionally hard cases.
 
 ### Speedups (seq vs cpu_omp, 10 runs, median)
 
 ```
-benchmark,seq_s,cpu_omp_speedup
-aliased_pointer_write,0.0025,0.154
-call_chain,0.0029,0.091
-conditional_call,0.0037,0.119
-function_pointer,0.0032,0.166
-global_writer,0.0022,0.197
-leaf_call,0.0029,0.112
-local_array,0.0033,0.136
-loop_invariant_call,0.0020,0.140
-pointer_escape,0.0015,0.078
-readonly_helper,0.0027,0.149
-recursive_sum,0.0018,0.110
-reduction_call,0.0019,0.244
+benchmark,seq_s,cpu_omp_speedup,gpu_naive_speedup,gpu_profitable_speedup
+aliased_pointer_write,0.0026,0.110,0.001,0.001
+call_chain,0.0029,0.122,0.001,0.001
+conditional_call,0.0029,0.070,0.001,0.001
+function_pointer,0.0035,0.157,0.001,0.001
+global_writer,0.0020,0.194,0.001,0.001
+leaf_call,0.0030,0.126,0.001,0.001
+local_array,0.0033,0.185,0.001,0.001
+loop_invariant_call,0.0019,0.063,0.001,0.001
+pointer_escape,0.0016,0.104,0.001,0.001
+readonly_helper,0.0034,0.116,0.001,0.001
+recursive_sum,0.0026,0.090,0.001,0.001
+reduction_call,0.0021,0.137,0.001,0.001
 
-Geometric mean cpu_omp/seq: 0.135x
+Geometric mean cpu_omp/seq: 0.117x
 ```
 
-The corpus is intentionally small (N≈200000) and the overhead of OpenMP thread launch dominates; speedup is not the metric of interest here.
+The corpus is intentionally small (N≈200000) and the overhead of OpenMP thread launch dominates; speedup is not the metric of interest here. GPU numbers are dominated by `nsys profile` overhead and should be ignored for performance claims.
 
 ## 2. PolyBench subset
 
-Configs evaluated: `seq`, `cpu_omp`. GPU configs skipped due to missing offload compiler.
+Configs evaluated: `seq`, `cpu_omp`, `gpu_naive`, `gpu_profitable`. Dataset: `LARGE_DATASET`.
 
 ```
-benchmark,seq_s,cpu_omp_speedup
-gemm,0.5479,4.239
-syr2k,2.2983,2.706
-syrk,0.5481,2.943
+benchmark,seq_s,cpu_omp_speedup,gpu_naive_speedup,gpu_profitable_speedup
+gemm,0.6273,4.184,0.221,0.221
+syr2k,2.6005,3.228,0.756,0.707
+syrk,0.5633,2.858,0.198,0.194
 
-Geometric mean cpu_omp/seq: 3.232x
+Geometric mean speedup vs. seq:
+  cpu_omp:        3.380x
+  gpu_naive:      0.321x
+  gpu_profitable: 0.311x
 ```
 
-Correctness: stdout-based diff is not meaningful for `-DPOLYBENCH_TIME` kernels; they emit timing to stderr. No output-integrity regression was observed by inspection of the generated sources.
+On these three memory-bound kernels, `cpu_omp` is substantially faster than sequential, while both GPU configs are much slower because host↔device transfer and kernel launch overhead dominate the compute. `gpu_profitable` does not currently choose CPU over GPU for these kernels; this is a known limitation of the cost model on this small subset.
+
+Correctness: stdout-based diff is not meaningful for `-DPOLYBENCH_TIME` kernels; they emit timing to stderr. All binaries ran to completion without crashes.
 
 ## 3. DataRaceBench safety-decision evaluation
 
@@ -95,9 +104,10 @@ The high false-positive count comes from DataRaceBench cases whose original Open
 
 ## 4. What is missing for the full claims
 
-- **Profitability claim**: requires an offload-capable clang and Nsight Systems to compare `gpu_naive` vs `gpu_profitable` end-to-end wall-clock speedups and to produce H2D/kernel/D2H breakdowns. See `build_gpu_clang.md`.
-- **Broader PolyBench claim**: requires extending `run_benchmarks.sh` to all 30 kernels or using the referenced `run_polybench_suite.py`.
-- **Rodinia**: not run; partly manual per-app curation is needed.
+- **Profitability claim**: a broader set of kernels (full PolyBench, Rodinia) and locked GPU clocks are needed to get clean `gpu_naive` vs `gpu_profitable` comparisons. The Nsight Systems CUPTI table-name mismatch also needs to be fixed to report H2D/kernel/D2H breakdown.
+- **Broader PolyBench claim**: extend `run_benchmarks.sh` to all 30 kernels or add a separate sweep script.
+- **Rodinia**: not run; per-app curation is needed.
+- **Interprocedural analysis**: add reduction-through-callee recognition and handle recursion/function-pointer sets more precisely.
 
 ## Files produced
 

@@ -30,8 +30,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Make the ROSE shared library discoverable for the translator.
-export LD_LIBRARY_PATH="/home/kamini/projects/hackathon-rose/rose-install/lib:${LD_LIBRARY_PATH:-}"
+# Make the ROSE shared library and offload clang runtime discoverable for the
+# translator and the GPU compiler. Respect any LD_LIBRARY_PATH the user already
+# exported (e.g. for a custom ROSE install or libomptarget).
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/home/kamini/projects/hackathon-rose/rose-install/lib}"
 
 SUITE="${1:-interproc-microbench}"
 LOOMX="${LOOMX:-$SCRIPT_DIR/../loomX}"
@@ -159,8 +161,12 @@ compile_one() {
             "$COMPILER_CPU" -O3 -fopenmp "$src" "${extra_flags[@]}" -o "$bin"
             ;;
         gpu_naive|gpu_profitable)
+            # Offload clang needs the OpenMP runtime headers (omp.h, omp-tools.h).
+            local omp_include="$(dirname "$COMPILER_GPU")/../projects/openmp/runtime/src"
+            [ -f "$omp_include/omp.h" ] || omp_include="$(dirname "$COMPILER_GPU")/../include"
             "$COMPILER_GPU" -O3 -fopenmp -fopenmp-targets=nvptx64-nvidia-cuda \
                 -Xopenmp-target -march="$GPU_ARCH" \
+                -I"$omp_include" \
                 "$src" "${extra_flags[@]}" -o "$bin"
             ;;
     esac
