@@ -17,6 +17,12 @@ public:
     // For SEQUENTIAL this does nothing.
     void generatePragmas(const loomX::LoopSummary& summary);
 
+    // Text-based post-processing: rewrite the unparsed source so that
+    // consecutive GPU-offload loops are wrapped in a single
+    // #pragma omp target data region. This avoids fragile AST rewrites for
+    // the structured block and is applied after project->unparse().
+    static void hoistTargetDataRegions(std::string& source);
+
 private:
     void insertCPUPragma(const loomX::LoopSummary& summary);
     void insertGPUPragma(const loomX::LoopSummary& summary);
@@ -27,4 +33,10 @@ private:
     std::string buildVarList(const std::set<SgInitializedName*>& vars);
     std::string buildReductionClause(
         const std::vector<loomX::ReductionInfo>& reductionDetails);
+
+    // Target-data hoisting helpers (text-based).
+    static std::set<std::string> collectMappedVars(const std::string& regionText);
+    static std::string stripTargetAndMap(const std::string& pragmaText);
+    static std::string buildTargetDataMapClause(
+        const std::set<std::string>& mappedVars);
 };

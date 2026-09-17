@@ -7,6 +7,8 @@
 #include "LoopAnalysisTypes.h"
 #include <iostream>
 #include <vector>
+#include <fstream>
+#include <sstream>
 
 using namespace loomX;
 
@@ -349,7 +351,9 @@ int main(int argc, char* argv[]) {
     // Generate output
     project->unparse();
 
-    // Post-process: prepend #include <omp.h> if we parallelized anything
+    // Post-process the unparsed source:
+    //   1. Hoist target data regions around consecutive GPU loops.
+    //   2. Prepend #include <omp.h> if not already present.
     if (parallelized > 0) {
         SgFilePtrList& files = project->get_fileList();
         if (!files.empty()) {
@@ -365,14 +369,19 @@ int main(int argc, char* argv[]) {
                                          std::istreambuf_iterator<char>());
                     inFile.close();
 
-                    // Check if omp.h is already included
+                    // Hoist target data regions (text-based).
+                    OpenMPCodeGen::hoistTargetDataRegions(content);
+
+                    // Check if omp.h is already included.
                     if (content.find("#include <omp.h>") == std::string::npos &&
                         content.find("#include \"omp.h\"") == std::string::npos) {
-                        std::ofstream outFile(outputName);
-                        if (outFile) {
-                            outFile << "#include <omp.h>\n\n" << content;
-                            outFile.close();
-                        }
+                        content = std::string("#include <omp.h>\n\n") + content;
+                    }
+
+                    std::ofstream outFile(outputName);
+                    if (outFile) {
+                        outFile << content;
+                        outFile.close();
                     }
                 }
             }
