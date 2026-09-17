@@ -16,10 +16,30 @@ bool contains(const std::string& text, const char* token) {
     return text.find(token) != std::string::npos;
 }
 
+void parseClauses(PragmaInfo& info) {
+    const std::string text = lower(info.text);
+    info.hasPrivate = contains(text, "private(");
+    info.hasFirstprivate = contains(text, "firstprivate(");
+    info.hasLastprivate = contains(text, "lastprivate(");
+    info.hasReduction = contains(text, "reduction(");
+    info.hasNowait = contains(text, "nowait");
+    info.hasOrdered = contains(text, "ordered");
+    info.hasDepend = contains(text, "depend(");
+    info.hasThreadprivate = contains(text, "threadprivate");
+}
+
 } // namespace
 
 PragmaEffect PragmaAnalysis::classify(const std::string& sourceText) {
     std::string text = lower(sourceText);
+
+    if (contains(text, "loomx metadata")) {
+        return PragmaEffect::ANALYSIS_ONLY;
+    }
+
+    if (contains(text, "loomx semantic synchronization")) {
+        return PragmaEffect::SYNCHRONIZATION;
+    }
 
     if (contains(text, "scop") && !contains(text, "omp")) {
         return PragmaEffect::ANALYSIS_ONLY;
@@ -103,12 +123,23 @@ PragmaAnalysisResult PragmaAnalysis::analyze(SgForStatement* loop) const {
         info.declaration = pragma;
         info.text = pragma->unparseToString();
         info.effect = classify(info.text);
+        parseClauses(info);
         result.pragmas.push_back(info);
+
+        result.hasDataSharingClauses =
+            result.hasDataSharingClauses || info.hasPrivate ||
+            info.hasFirstprivate || info.hasLastprivate;
+        result.hasLastprivate = result.hasLastprivate || info.hasLastprivate;
+        result.hasReduction = result.hasReduction || info.hasReduction;
+        result.hasTaskDependencies = result.hasTaskDependencies || info.hasDepend;
+        result.hasOrderedRegion = result.hasOrderedRegion || info.hasOrdered;
+        result.hasNowait = result.hasNowait || info.hasNowait;
+        result.hasThreadprivate = result.hasThreadprivate || info.hasThreadprivate;
 
         if (info.effect == PragmaEffect::SYNCHRONIZATION) {
             result.blocksTransformation = true;
             result.hasSynchronization = true;
-            result.reason = "existing synchronization pragma: " + info.text;
+            result.reason = "existing synchronization/ordering pragma: " + info.text;
         } else if (info.effect == PragmaEffect::EXISTING_PARALLEL ||
                    info.effect == PragmaEffect::DEVICE_REGION) {
             result.blocksTransformation = true;

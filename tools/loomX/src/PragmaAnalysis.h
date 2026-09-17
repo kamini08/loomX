@@ -20,6 +20,14 @@ struct PragmaInfo {
     PragmaEffect effect = PragmaEffect::NONE;
     std::string text;
     SgPragmaDeclaration* declaration = nullptr;
+    bool hasPrivate = false;
+    bool hasFirstprivate = false;
+    bool hasLastprivate = false;
+    bool hasReduction = false;
+    bool hasNowait = false;
+    bool hasOrdered = false;
+    bool hasDepend = false;
+    bool hasThreadprivate = false;
 };
 
 struct PragmaAnalysisResult {
@@ -27,6 +35,13 @@ struct PragmaAnalysisResult {
     bool blocksTransformation = false;
     bool alreadyParallel = false;
     bool hasSynchronization = false;
+    bool hasDataSharingClauses = false;
+    bool hasLastprivate = false;
+    bool hasReduction = false;
+    bool hasTaskDependencies = false;
+    bool hasOrderedRegion = false;
+    bool hasNowait = false;
+    bool hasThreadprivate = false;
     std::string reason;
 };
 

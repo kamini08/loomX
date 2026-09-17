@@ -168,11 +168,12 @@ AffineSubscript LoopDependenceAnalysis::extractAffineSubscript(
             result.constant = 0;
             return result;
         }
-        // A different variable is treated as an unknown symbolic constant.
-        result.isAffine = true;
-        result.coefficient = 0;
-        result.constant = 0;
-        result.note = "symbolic constant";
+        // A variable other than the loop index is not a compile-time
+        // constant. Treating it as coefficient-zero can incorrectly prove
+        // indirect accesses such as a[indexSet[i]] independent. Unknown
+        // subscripts must remain conservative until range/alias analysis can
+        // prove disjointness.
+        result.note = "unknown symbolic subscript";
         return result;
     }
 

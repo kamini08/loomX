@@ -34,6 +34,89 @@ static bool isScalarVariable(SgInitializedName* var) {
     return true;
 }
 
+static bool isSharedScalarStorage(SgInitializedName* var) {
+    if (!var) return false;
+    if (var->get_declaration() && SageInterface::isStatic(var->get_declaration())) {
+        return true;
+    }
+    return isSgGlobal(var->get_scope()) != nullptr;
+}
+
+static bool hasUnprovenScalarWrites(SgForStatement* loop,
+                                    const loomX::LoopSummary& summary) {
+    SgStatement* loopBody = loop ? loop->get_loop_body() : nullptr;
+    if (!loopBody) return false;
+
+    SgInitializedName* loopVar = SageInterface::getLoopIndexVariable(loop);
+    std::set<SgInitializedName*> reductionVars = summary.getReductionVariables();
+    std::vector<SgNode*> readRefs, writeRefs;
+    SageInterface::collectReadWriteRefs(loopBody, readRefs, writeRefs);
+
+    for (SgNode* ref : writeRefs) {
+        SgVarRefExp* varRef = isSgVarRefExp(ref);
+        if (!varRef) continue;
+        SgInitializedName* var = varRef->get_symbol()->get_declaration();
+        if (!var || var == loopVar || reductionVars.count(var)) continue;
+        if (!isScalarVariable(var)) continue;
+
+        SgScopeStatement* scope = var->get_scope();
+        SgNode* current = scope;
+        bool declaredInsideLoop = false;
+        while (current && !isSgFunctionDefinition(current)) {
+            if (current == loopBody) {
+                declaredInsideLoop = true;
+                break;
+            }
+            current = current->get_parent();
+        }
+        if (!declaredInsideLoop) return true;
+    }
+    return false;
+}
+
+static bool hasScalarLiveOut(SgForStatement* loop) {
+    if (!loop) return false;
+    SgStatement* body = loop->get_loop_body();
+    if (!body) return false;
+
+    SgFunctionDefinition* function = nullptr;
+    for (SgNode* current = loop; current; current = current->get_parent()) {
+        if ((function = isSgFunctionDefinition(current))) break;
+    }
+    if (!function) return false;
+
+    std::vector<SgNode*> loopReads, loopWrites;
+    SageInterface::collectReadWriteRefs(body, loopReads, loopWrites);
+    std::set<SgInitializedName*> writtenScalars;
+    for (SgNode* ref : loopWrites) {
+        SgVarRefExp* varRef = isSgVarRefExp(ref);
+        if (!varRef) continue;
+        SgInitializedName* var = varRef->get_symbol()->get_declaration();
+        if (var && isScalarVariable(var)) writtenScalars.insert(var);
+    }
+    if (writtenScalars.empty()) return false;
+
+    long loopEnd = loop->get_file_info() ? loop->get_file_info()->get_line() : 0;
+    Rose_STL_Container<SgNode*> loopNodes = NodeQuery::querySubTree(loop, V_SgNode);
+    for (SgNode* node : loopNodes) {
+        if (node->get_file_info()) {
+            loopEnd = std::max(loopEnd,
+                               static_cast<long>(node->get_file_info()->get_line()));
+        }
+    }
+
+    std::vector<SgNode*> functionReads, functionWrites;
+    SageInterface::collectReadWriteRefs(function->get_body(), functionReads, functionWrites);
+    for (SgNode* ref : functionReads) {
+        SgVarRefExp* varRef = isSgVarRefExp(ref);
+        if (!varRef) continue;
+        SgInitializedName* var = varRef->get_symbol()->get_declaration();
+        if (!var || !writtenScalars.count(var)) continue;
+        if (varRef->get_file_info() && varRef->get_file_info()->get_line() > loopEnd) return true;
+    }
+    return false;
+}
+
 // Return the innermost SgStatement that contains the given AST node.
 static SgStatement* getEnclosingStatement(SgNode* node) {
     while (node && !isSgStatement(node)) {
@@ -92,6 +175,16 @@ static bool hasScalarLoopCarriedDependence(SgForStatement* loop,
 
         // Skip reduction variables.
         if (reductionVars.find(var) != reductionVars.end()) continue;
+
+        // Static locals and globals retain one storage location across all
+        // iterations. They cannot be made private by an OpenMP clause.
+        if (isSharedScalarStorage(var) &&
+            !summary.pragmas.hasDataSharingClauses &&
+            !summary.pragmas.hasReduction && !summary.pragmas.hasThreadprivate) {
+            description = "shared scalar storage may race: " +
+                          var->get_name().getString();
+            return true;
+        }
 
         // Skip variables declared inside the loop body.
         SgScopeStatement* varScope = var->get_scope();
@@ -445,6 +538,7 @@ int main(int argc, char* argv[]) {
     bool verbose = false;
     bool intraproceduralBaseline = false;
     bool scalarDepCheck = true;
+    bool strictRaceSafety = false;
     TranslationMode mode = TranslationMode::GPU_PROFITABLE;
     loomX::ProfitabilityConfig config;
     std::string explicitOutputFile;
@@ -457,6 +551,8 @@ int main(int argc, char* argv[]) {
             intraproceduralBaseline = true;
         } else if (arg == "--no-scalar-dep-check") {
             scalarDepCheck = false;
+        } else if (arg == "--strict-race-safety") {
+            strictRaceSafety = true;
         } else if (arg == "--cpu-only") {
             mode = TranslationMode::CPU_ONLY;
         } else if (arg == "--gpu-naive") {
@@ -493,6 +589,7 @@ int main(int argc, char* argv[]) {
     if (args.empty()) {
         std::cerr << "Usage: " << argv[0]
                   << " [-v|--verbose] [--intraprocedural-baseline] [--no-scalar-dep-check]"
+                  << " [--strict-race-safety]"
                   << " [--cpu-only|--gpu-naive|--gpu-profitable|--analyze-only]"
                   << " [--min-gpu-speedup <f>] [--min-nested-flop <n>]"
                   << " [--min-total-flop <n>] [--compute-bound-threshold <f>]"
@@ -609,6 +706,26 @@ int main(int argc, char* argv[]) {
         }
         if (summary.hasFunctionCalls && summary.allFunctionCallsSafe) {
             std::cout << "  -> All function calls are safe (interprocedural analysis)\n";
+        }
+
+        if (strictRaceSafety && !summary.reductions.empty() &&
+            !summary.pragmas.hasReduction) {
+            std::cout << "  -> Skipped: strict race safety requires explicit reduction proof\n";
+            skipped++;
+            continue;
+        }
+        if (strictRaceSafety && hasUnprovenScalarWrites(loop, summary) &&
+            !summary.pragmas.hasDataSharingClauses &&
+            !summary.pragmas.hasThreadprivate && !summary.pragmas.hasReduction) {
+            std::cout << "  -> Skipped: strict race safety requires explicit scalar privatization proof\n";
+            skipped++;
+            continue;
+        }
+        if (strictRaceSafety && hasScalarLiveOut(loop) &&
+            !summary.pragmas.hasLastprivate) {
+            std::cout << "  -> Skipped: strict race safety requires lastprivate for live-out scalar\n";
+            skipped++;
+            continue;
         }
 
         // Apply translation-mode override for ablation experiments.
