@@ -4,6 +4,7 @@
 #include "OpenMPCodeGen.h"
 #include "LoopSummary.h"
 #include "LoopDependenceAnalysis.h"
+#include "PragmaAnalysis.h"
 #include "LoopAnalysisTypes.h"
 #include <iostream>
 #include <vector>
@@ -352,6 +353,8 @@ loomX::LoopSummary buildSummary(SgForStatement* loop,
                                 InterproceduralAnalysis& ipa,
                                 SgInitializedName* loopVar) {
     loomX::LoopSummary summary = profitability.summarize(loop);
+    PragmaAnalysis pragmaAnalysis;
+    summary.pragmas = pragmaAnalysis.analyze(loop);
 
     // Interprocedural safety for function calls inside the loop.
     Rose_STL_Container<SgNode*> calls =
@@ -580,6 +583,12 @@ int main(int argc, char* argv[]) {
 
         // Build the full loop summary (analyses + decision + codegen inputs).
         loomX::LoopSummary summary = buildSummary(loop, profitability, ipa, loopVar);
+
+        if (summary.pragmas.blocksTransformation) {
+            std::cout << "  -> Skipped: " << summary.pragmas.reason << "\n";
+            skipped++;
+            continue;
+        }
 
         // Reject loops with scalar loop-carried dependences that are not
         // recognized reductions (unless disabled for lenient evaluation).

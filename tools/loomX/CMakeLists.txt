@@ -94,6 +94,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         src/ComputeIntensityEstimator.cpp
         src/ReductionDetector.cpp
         src/LoopDependenceAnalysis.cpp
+        src/PragmaAnalysis.cpp
     )
     target_include_directories(loomX PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(loomX PRIVATE Rose::rose)
@@ -119,6 +120,7 @@ else()
         src/ComputeIntensityEstimator.cpp
         src/ReductionDetector.cpp
         src/LoopDependenceAnalysis.cpp
+        src/PragmaAnalysis.cpp
     )
 
     add_executable(tools_loomX_exe ${tools_loomX_exe_SOURCES})

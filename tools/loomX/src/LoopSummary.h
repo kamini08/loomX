@@ -1,6 +1,7 @@
 #pragma once
 #include "rose.h"
 #include "LoopAnalysisTypes.h"
+#include "PragmaAnalysis.h"
 #include <set>
 #include <vector>
 
@@ -18,6 +19,7 @@ struct LoopSummary {
     DivergenceResult divergence;
     ComputeIntensityResult intensity;
     std::vector<ReductionInfo> reductions;
+    PragmaAnalysisResult pragmas;
 
     // Interprocedural safety for any function calls inside the loop.
     bool hasFunctionCalls = false;
