@@ -23,30 +23,35 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 
 def run_loomx(loomx_path, src_path, mode="cpu-only"):
-    """Run loomX on src_path and return True if any loop was parallelized."""
-    out_path = src_path + ".loomx.c"
-    try:
-        subprocess.run(
-            [loomx_path, f"--{mode}", src_path, "-o", out_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=120,
-            check=False,
-        )
-    except Exception as e:
-        print(f"  [warn] loomX failed on {src_path}: {e}", file=sys.stderr)
-        return False
+    """Run loomX on src_path and return True if any loop was parallelized.
+    Output is written to a temporary directory so stale .loomx.c files do not
+    affect later runs or get scanned as DRB sources.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        out_path = os.path.join(td, os.path.basename(src_path) + ".loomx.c")
+        try:
+            subprocess.run(
+                [loomx_path, f"--{mode}", src_path, "-o", out_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=120,
+                check=False,
+            )
+        except Exception as e:
+            print(f"  [warn] loomX failed on {src_path}: {e}", file=sys.stderr)
+            return False
 
-    if not os.path.exists(out_path):
-        return False
+        if not os.path.exists(out_path):
+            return False
 
-    with open(out_path) as f:
-        content = f.read()
-    # A parallelized loop will contain an OpenMP pragma.
-    return "#pragma omp" in content
+        with open(out_path) as f:
+            content = f.read()
+        # A parallelized loop will contain an OpenMP pragma.
+        return "#pragma omp" in content
 
 
 def parse_label(filename):
