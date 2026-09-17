@@ -27,6 +27,13 @@ struct FunctionSummary {
     // Is this function part of a recursive cycle?
     bool inRecursiveCycle = false;
 
+    // Estimated work per call (static).  local* is the function body's own
+    // work; estimated* includes all non-recursive callees, propagated bottom-up.
+    long long localFlops = 0;
+    long long localMemOps = 0;
+    long long estimatedFlops = 0;
+    long long estimatedMemOps = 0;
+
     // Parameter access (by index)
     std::set<int> readParams;
     std::set<int> writtenParams;

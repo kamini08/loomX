@@ -14,14 +14,17 @@ Usage:
   python3 check_correctness.py golden.out candidate.out --rtol 1e-5 --atol 1e-8
 """
 import argparse
+import math
 import sys
-
-import numpy as np
 
 
 def load(path):
     with open(path) as f:
-        return np.array([float(x) for x in f.read().split()])
+        return [float(x) for x in f.read().split()]
+
+
+def isclose(a, b, rtol, atol):
+    return abs(a - b) <= (atol + rtol * abs(b))
 
 
 def main():
@@ -33,19 +36,29 @@ def main():
     args = ap.parse_args()
 
     g, c = load(args.golden), load(args.candidate)
-    if g.shape != c.shape:
-        print(f"FAIL: shape mismatch golden={g.shape} candidate={c.shape}")
+    if len(g) != len(c):
+        print(f"FAIL: shape mismatch golden={len(g)} candidate={len(c)}")
         sys.exit(1)
 
-    close_mask = np.isclose(g, c, rtol=args.rtol, atol=args.atol)
-    ok = bool(close_mask.all())
-    diff = np.abs(g - c)
-    max_abs = float(diff.max()) if diff.size else 0.0
-    max_rel = float((diff / (np.abs(g) + args.atol)).max()) if diff.size else 0.0
-    n_bad = int((~close_mask).sum())
+    if not g:
+        print("elements=0  max_abs_diff=0.000e+00  max_rel_diff=0.000e+00  mismatches=0/0")
+        print("PASS")
+        sys.exit(0)
 
-    print(f"elements={g.size}  max_abs_diff={max_abs:.3e}  "
-          f"max_rel_diff={max_rel:.3e}  mismatches={n_bad}/{g.size}")
+    max_abs = 0.0
+    max_rel = 0.0
+    n_bad = 0
+    for gv, cv in zip(g, c):
+        adiff = abs(gv - cv)
+        max_abs = max(max_abs, adiff)
+        rdiff = adiff / (abs(gv) + args.atol)
+        max_rel = max(max_rel, rdiff)
+        if not isclose(gv, cv, args.rtol, args.atol):
+            n_bad += 1
+
+    ok = n_bad == 0
+    print(f"elements={len(g)}  max_abs_diff={max_abs:.3e}  "
+          f"max_rel_diff={max_rel:.3e}  mismatches={n_bad}/{len(g)}")
     print("PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 

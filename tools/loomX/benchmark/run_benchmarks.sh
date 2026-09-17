@@ -83,7 +83,8 @@ elif [ "$SUITE" = "polybench" ]; then
         exit 1
     fi
     BENCHES=(gemm syrk syr2k)
-    BENCH_SRC_DIR="$PB_DIR/linear-algebra/kernels"
+    BENCH_SRC_DIR="$PB_DIR/linear-algebra/blas"
+    PB_UTILITIES_DIR="$PB_DIR/utilities"
 else
     echo "ERROR: unknown suite '$SUITE'" >&2
     exit 1
@@ -99,15 +100,20 @@ generate_one() {
 
     cp "$src" "out/$name/${name}__seq.c"
 
-    "$LOOMX" --cpu-only "$src" -o "out/$name/${name}__cpu_omp.c" >/dev/null 2>&1 || {
+    local loomx_args=()
+    if [ "$SUITE" = "polybench" ]; then
+        loomx_args+=(-I"$PB_UTILITIES_DIR" -I"$BENCH_SRC_DIR/$name")
+    fi
+
+    "$LOOMX" --cpu-only "${loomx_args[@]}" "$src" -o "out/$name/${name}__cpu_omp.c" >/dev/null 2>&1 || {
         echo "  WARN: loomX --cpu-only failed for $name"
         return 1
     }
-    "$LOOMX" --gpu-naive "$src" -o "out/$name/${name}__gpu_naive.c" >/dev/null 2>&1 || {
+    "$LOOMX" --gpu-naive "${loomx_args[@]}" "$src" -o "out/$name/${name}__gpu_naive.c" >/dev/null 2>&1 || {
         echo "  WARN: loomX --gpu-naive failed for $name"
         return 1
     }
-    "$LOOMX" --gpu-profitable "$src" -o "out/$name/${name}__gpu_profitable.c" >/dev/null 2>&1 || {
+    "$LOOMX" --gpu-profitable "${loomx_args[@]}" "$src" -o "out/$name/${name}__gpu_profitable.c" >/dev/null 2>&1 || {
         echo "  WARN: loomX --gpu-profitable failed for $name"
         return 1
     }
@@ -137,9 +143,10 @@ compile_one() {
 
     local extra_flags=(-lm)
     if [ "$SUITE" = "polybench" ]; then
-        extra_flags+=(-DPOLYBENCH_TIME -I"$BENCH_SRC_DIR/../utilities")
+        # Kernel-specific header (e.g. gemm.h) lives next to the .c source.
+        extra_flags+=(-DPOLYBENCH_TIME -DLARGE_DATASET -I"$PB_UTILITIES_DIR" -I"$BENCH_SRC_DIR/$name")
         # PolyBench kernels need utilities/polybench.c linked in.
-        extra_flags+=("$BENCH_SRC_DIR/../utilities/polybench.c")
+        extra_flags+=("$PB_UTILITIES_DIR/polybench.c")
     elif [ "$SUITE" = "interproc-microbench" ]; then
         extra_flags+=(-I"$BENCH_SRC_DIR")
     fi

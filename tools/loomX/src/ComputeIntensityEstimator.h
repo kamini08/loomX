@@ -18,6 +18,12 @@ public:
     ComputeIntensityResult analyze(SgForStatement* loop,
                                    double targetFLOPsPerMemOp = 8.0);
 
+    // Estimate the static work (FLOPs and memory ops) inside a function body.
+    // Nested loops are multiplied by their trip counts, matching the behaviour
+    // of analyze().  This is exposed so interprocedural analysis can include
+    // callee work in loop profitability estimates.
+    ComputeIntensityResult estimateFunctionWork(SgFunctionDefinition* def);
+
 private:
     LoopCanonicalChecker canonicalChecker_;
     IterationCountEstimator iterationEstimator_;

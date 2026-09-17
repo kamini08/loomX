@@ -21,6 +21,10 @@ public:
     // Build a complete LoopSummary for a loop, including the target decision.
     loomX::LoopSummary summarize(SgForStatement* loop);
 
+    // Re-run the target decision on a summary whose analysis fields have been
+    // modified (e.g. after adding interprocedural callee work estimates).
+    void reevaluateTarget(loomX::LoopSummary& summary);
+
     // Access the underlying analyzers for detailed diagnostics.
     loomX::LoopCanonicalChecker& getCanonicalChecker() { return canonicalChecker_; }
     loomX::IterationCountEstimator& getIterationEstimator() { return iterationEstimator_; }
@@ -44,6 +48,11 @@ private:
     double estimateCpuTime(const loomX::LoopSummary& summary) const;
     double estimateGpuTime(const loomX::LoopSummary& summary) const;
     double estimateDataMovementBytes(const loomX::LoopSummary& summary) const;
+
+    // Gap-1 helpers: loop-purpose detection and total-work filtering.
+    long long totalFlops(const loomX::LoopSummary& summary) const;
+    bool isInitializationLoop(const loomX::LoopSummary& summary) const;
+    bool isReductionOnlyLoop(const loomX::LoopSummary& summary) const;
 
     // Legacy helpers retained for backward compatibility.
     long estimateIterationCount(SgForStatement* loop);

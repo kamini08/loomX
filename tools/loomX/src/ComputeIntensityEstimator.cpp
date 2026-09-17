@@ -74,20 +74,25 @@ void ComputeIntensityEstimator::countOperations(SgStatement* body,
 
     // Memory operations: array references and pointer dereferences.
     // Skip those that are inside a nested loop; those are handled recursively.
+    // Memory operations: array references and pointer dereferences.
+    // Skip those that are inside a nested loop; those are handled recursively.
+    // Also skip the base of a multi-dimensional access (e.g. in A[i][j] only
+    // count the outermost A[i][j] expression, not the inner A[i]).
     Rose_STL_Container<SgNode*> arrRefs =
         NodeQuery::querySubTree(body, V_SgPntrArrRefExp);
     for (SgNode* node : arrRefs) {
-        if (!isInsideNestedLoop(node, body)) {
-            memOps += tripCount;
-        }
+        if (isInsideNestedLoop(node, body)) continue;
+        SgPntrArrRefExp* arrRef = isSgPntrArrRefExp(node);
+        if (!arrRef) continue;
+        if (isSgPntrArrRefExp(arrRef->get_parent())) continue;
+        memOps += tripCount;
     }
 
     Rose_STL_Container<SgNode*> derefRefs =
         NodeQuery::querySubTree(body, V_SgPointerDerefExp);
     for (SgNode* node : derefRefs) {
-        if (!isInsideNestedLoop(node, body)) {
-            memOps += tripCount;
-        }
+        if (isInsideNestedLoop(node, body)) continue;
+        memOps += tripCount;
     }
 
     // Count binary operations.
@@ -170,6 +175,36 @@ void ComputeIntensityEstimator::countOperations(SgStatement* body,
         countOperations(nestedBody, nestedTrip * tripCount,
                         flops, memOps, intOps, heavyMath);
     }
+}
+
+ComputeIntensityResult ComputeIntensityEstimator::estimateFunctionWork(
+    SgFunctionDefinition* def) {
+    ComputeIntensityResult result;
+    if (!def) {
+        result.note = "null function definition";
+        return result;
+    }
+
+    SgStatement* body = def->get_body();
+    long long intOps = 0;
+    bool heavyMath = false;
+    countOperations(body, 1, result.flopCount, result.memoryOpCount,
+                    intOps, heavyMath);
+    result.integerOpCount = intOps;
+    result.hasHeavyMath = heavyMath;
+
+    if (result.memoryOpCount == 0) {
+        result.flopsPerMemoryOp = static_cast<double>(result.flopCount);
+        result.classification = IntensityClass::COMPUTE_BOUND;
+    } else {
+        result.flopsPerMemoryOp = static_cast<double>(result.flopCount) /
+                                  static_cast<double>(result.memoryOpCount);
+        result.classification = (result.flopsPerMemoryOp >= 8.0)
+                                    ? IntensityClass::COMPUTE_BOUND
+                                    : IntensityClass::BALANCED;
+    }
+    result.note = "Interprocedural function-body estimate";
+    return result;
 }
 
 bool ComputeIntensityEstimator::isFloatingPointOp(SgBinaryOp* op) {

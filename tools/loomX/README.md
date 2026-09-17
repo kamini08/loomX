@@ -17,12 +17,21 @@ The profitability and safety pipeline is split into dedicated analyzers in
 * `DivergenceAnalyzer` — classifies data-dependent branches, early exits,
   nested loops, and function-call divergence.
 * `ComputeIntensityEstimator` — counts FLOPs, integer ops, and memory accesses
-  to label loops as memory-bound, balanced, or compute-bound.
+  to label loops as memory-bound, balanced, or compute-bound.  Exposes a
+  function-body work estimator for interprocedural analysis.
 * `ReductionDetector` — finds reduction variables and their operators
   (`+`, `-`, `*`, `min`, `max`, `&`, `|`, `^`).
+* `InterproceduralAnalysis` — builds per-function side-effect summaries and a
+  call graph, then decides whether function calls are safe inside parallel
+  loops.  Supports loop-disjoint pointer writes such as `arr[idx]`,
+  `arr[idx + c]`, `arr[idx - c]`, and `*(p + idx)`.
+* `LoopDependenceAnalysis` — checks for loop-carried dependences before
+  parallelization.
 
 `GpuProfitability` orchestrates these analyzers to choose between sequential,
-CPU OpenMP, and GPU offload targets.
+CPU OpenMP, and GPU offload targets.  The cost model now includes PCIe
+latency, data-transfer bandwidth, and callee work estimates so that small or
+memory-bound loops stay on the CPU while large compute kernels are offloaded.
 
 ## Building inside ROSE (CMake)
 
@@ -61,10 +70,40 @@ make -j$(nproc)
 
 The transformed source is written to `rose_input.c`.
 
+Tunable profitability thresholds:
+
+* `--min-gpu-speedup <f>` — minimum CPU/GPU speedup to justify offload
+  (default 1.2).
+* `--min-total-flop <n>` — minimum total FLOPs (body FLOPs × iterations) for
+  GPU offload (default 10,000,000).
+* `--min-nested-flop <n>` — minimum body FLOPs for the nested-loop GPU
+  heuristic (default 1,000,000).
+* `--compute-bound-threshold <f>` — FLOPs per memory-op threshold used to label
+  a loop compute-bound (default 16.0).
+
+Translation modes for ablation experiments:
+
+* `--cpu-only` — force CPU OpenMP for all safe loops.
+* `--gpu-naive` — offload every safe loop to the GPU.
+* `--gpu-profitable` — use the profitability model (default).
+
+Other flags:
+
+* `-v` / `--verbose` — print analysis summaries.
+* `--intraprocedural-baseline` — reject all pointer-parameter writes, mimicking
+  a purely intraprocedural safety analysis.
+
 ## Quick validation
 
-After building, compile the original and transformed sources with an OpenMP
-compiler and compare their outputs:
+A test harness runs `loomX` on every `tests/*.c` file, compiles both the
+original and transformed sources with `gcc -O2 -fopenmp`, and compares exit
+codes:
+
+```bash
+./tools/loomX/tests/run_tests.sh
+```
+
+For manual validation of a single file:
 
 ```bash
 ./loomX -rose:skipfinalCompileStep tests/benchmark1.c
