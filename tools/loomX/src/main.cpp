@@ -252,6 +252,16 @@ int main(int argc, char* argv[]) {
             config.minNestedFlopForGPU = std::stoll(argv[++i]);
         } else if (arg == "--compute-bound-threshold" && i + 1 < argc) {
             config.computeBoundThreshold = std::stod(argv[++i]);
+        } else if (arg == "--gpu-compute-efficiency" && i + 1 < argc) {
+            config.gpuComputeEfficiency = std::stod(argv[++i]);
+        } else if (arg == "--heavy-math-cost" && i + 1 < argc) {
+            config.heavyMathCostFactor = std::stod(argv[++i]);
+        } else if (arg == "--pcie-factor" && i + 1 < argc) {
+            config.pcieTransferFactor = std::stod(argv[++i]);
+        } else if (arg == "--cpu-cache-reuse" && i + 1 < argc) {
+            config.cpuCacheReuseFactor = std::stod(argv[++i]);
+        } else if (arg == "--gpu-reduction-overhead" && i + 1 < argc) {
+            config.gpuReductionOverhead = std::stod(argv[++i]);
         } else if ((arg == "-o" || arg == "--output") && i + 1 < argc) {
             explicitOutputFile = argv[++i];
         } else {
@@ -264,7 +274,10 @@ int main(int argc, char* argv[]) {
                   << " [-v|--verbose] [--intraprocedural-baseline]"
                   << " [--cpu-only|--gpu-naive|--gpu-profitable]"
                   << " [--min-gpu-speedup <f>] [--min-nested-flop <n>]"
-                  << " [--compute-bound-threshold <f>] <input.c> [-o output.c]\n";
+                  << " [--compute-bound-threshold <f>]"
+                  << " [--gpu-compute-efficiency <f>] [--heavy-math-cost <f>]"
+                  << " [--pcie-factor <f>] [--cpu-cache-reuse <f>]"
+                  << " [--gpu-reduction-overhead <f>] <input.c> [-o output.c]\n";
         return 1;
     }
 

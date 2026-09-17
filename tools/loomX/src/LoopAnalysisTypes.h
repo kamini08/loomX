@@ -9,6 +9,10 @@ enum class ParallelTarget { SEQUENTIAL, CPU_OPENMP, GPU_OFFLOAD };
 
 // Tunable parameters for the GPU profitability cost model.
 struct ProfitabilityConfig {
+    // Default iteration count used when the loop bound is symbolic and cannot
+    // be evaluated at compile time.
+    long defaultIterationsForSymbolicBound = 100000;
+
     // Minimum iterations to consider any parallelization.
     long minIterationsForParallel = 100;
 
@@ -39,6 +43,47 @@ struct ProfitabilityConfig {
 
     // GPU must be at least this many times faster than CPU to justify offload.
     double minGpuSpeedup = 1.2;
+
+    // ----- Second-order heuristics -----
+
+    // GPU hardware sizing for utilization penalty.  A loop with too few
+    // iterations cannot fill the device, so effective compute throughput is
+    // reduced.  These defaults describe a mid-sized NVIDIA GPU; override for
+    // the actual target hardware.
+    int gpuSMCount = 80;
+    int gpuWarpsPerSM = 16;
+    int gpuThreadsPerWarp = 32;
+
+    // Fraction of peak FP throughput a typical kernel actually achieves
+    // (memory latency, instruction mix, occupancy, etc.).
+    double gpuComputeEfficiency = 0.5;
+
+    // Heavy math (sin/cos/sqrt/exp/log) is expensive on both host and device,
+    // but the relative penalty differs.  This factor inflates GPU compute time
+    // for kernels containing such calls.
+    double heavyMathCostFactor = 8.0;
+
+    // Fraction of total memory traffic that crosses PCIe.  With target-data
+    // hoisting this can be much less than 1.0 because data is resident on the
+    // device across multiple kernels.
+    double pcieTransferFactor = 1.0;
+
+    // CPU cache reuse factor for unit-stride/sequential accesses.  The naive
+    // memory-time estimate assumes every access misses in cache; this factor
+    // scales down CPU memory traffic when the access pattern is cache-friendly.
+    double cpuCacheReuseFactor = 0.25;
+
+    // Extra overhead per reduction variable on the GPU (tree reduction).
+    double gpuReductionOverhead = 1e-6;
+};
+
+// Dominant memory-access pattern for a loop, used to model cache reuse on
+// the CPU and coalescing on the GPU.
+enum class AccessPattern {
+    UNKNOWN,
+    UNIT_STRIDE,    // Index is exactly the loop variable (plus optional cast)
+    STRIDED,        // Linear function of the loop variable, e.g. a[i*2]
+    IRREGULAR       // Index involves other variables, function calls, etc.
 };
 
 // Canonical form classification for a for-loop.
@@ -127,6 +172,7 @@ enum class IntensityClass {
 // Result of compute-intensity estimation.
 struct ComputeIntensityResult {
     IntensityClass classification = IntensityClass::UNKNOWN;
+    AccessPattern accessPattern = AccessPattern::UNKNOWN;
     double flopsPerMemoryOp = 0.0;   // FLOPs per memory access
     long long flopCount = 0;         // Static estimate of FP operations
     long long memoryOpCount = 0;     // Static estimate of memory accesses

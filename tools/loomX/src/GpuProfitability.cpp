@@ -12,6 +12,16 @@ namespace {
 // double-precision (8 bytes) per access; this can be made type-aware later.
 constexpr double BYTES_PER_MEM_OP = 8.0;
 
+const char* accessPatternName(loomX::AccessPattern pat) {
+    using namespace loomX;
+    switch (pat) {
+        case AccessPattern::UNIT_STRIDE: return "unit";
+        case AccessPattern::STRIDED: return "strided";
+        case AccessPattern::IRREGULAR: return "irregular";
+        default: return "unknown";
+    }
+}
+
 } // namespace
 
 GpuProfitability::GpuProfitability()
@@ -59,10 +69,17 @@ double GpuProfitability::estimateCpuTime(const loomX::LoopSummary& summary) cons
     double flops = static_cast<double>(summary.intensity.flopCount);
     double memBytes = static_cast<double>(summary.intensity.memoryOpCount) * BYTES_PER_MEM_OP;
 
-    double computeTime = flops / (config_.cpuComputeThroughput * 1e9); // seconds
-    double memoryTime = memBytes / (config_.cpuMemoryBandwidth * 1e9); // seconds
+    // Unit-stride accesses benefit from cache line reuse on the CPU.
+    double cacheReuse = 1.0;
+    if (summary.intensity.accessPattern == AccessPattern::UNIT_STRIDE) {
+        cacheReuse = config_.cpuCacheReuseFactor;
+    } else if (summary.intensity.accessPattern == AccessPattern::STRIDED) {
+        cacheReuse = 0.5;
+    }
 
-    // CPU can often reuse cache, so memory time is an upper bound.
+    double computeTime = flops / (config_.cpuComputeThroughput * 1e9); // seconds
+    double memoryTime = (memBytes * cacheReuse) / (config_.cpuMemoryBandwidth * 1e9);
+
     return computeTime + memoryTime;
 }
 
@@ -76,14 +93,43 @@ double GpuProfitability::estimateDataMovementBytes(const loomX::LoopSummary& sum
 double GpuProfitability::estimateGpuTime(const loomX::LoopSummary& summary) const {
     double flops = static_cast<double>(summary.intensity.flopCount);
     double memBytes = static_cast<double>(summary.intensity.memoryOpCount) * BYTES_PER_MEM_OP;
-    double dataBytes = estimateDataMovementBytes(summary);
+    double dataBytes = estimateDataMovementBytes(summary) * config_.pcieTransferFactor;
 
-    double launchTime = config_.kernelLaunchOverhead * 1e-6; // seconds
-    double computeTime = flops / (config_.gpuComputeThroughput * 1e9);
-    double memoryTime = memBytes / (config_.gpuMemoryBandwidth * 1e9);
+    long iterations = summary.iterationCount;
+    if (iterations < 0) iterations = config_.defaultIterationsForSymbolicBound;
+
+    // GPU utilization: small loops cannot fill the device.
+    long totalThreadsNeeded = iterations;
+    long threadsPerSM = config_.gpuWarpsPerSM * config_.gpuThreadsPerWarp;
+    long threadsForFullUtil = config_.gpuSMCount * threadsPerSM;
+    double utilization = std::min(1.0, static_cast<double>(totalThreadsNeeded) /
+                                       static_cast<double>(threadsForFullUtil));
+    // Require at least a few warps per SM to hide latency.
+    utilization = std::max(utilization, 0.05);
+
+    // Coalescing: unit-stride accesses use full bandwidth; strided/irregular
+    // accesses waste bandwidth.
+    double coalescing = 1.0;
+    if (summary.intensity.accessPattern == AccessPattern::STRIDED) {
+        coalescing = 0.5;
+    } else if (summary.intensity.accessPattern == AccessPattern::IRREGULAR) {
+        coalescing = 0.25;
+    }
+
+    // Heavy math runs at lower effective throughput on the GPU.
+    double effectiveGpuCompute = config_.gpuComputeThroughput * config_.gpuComputeEfficiency;
+    if (summary.intensity.hasHeavyMath) {
+        effectiveGpuCompute /= config_.heavyMathCostFactor;
+    }
+
+    double launchTime = config_.kernelLaunchOverhead * 1e-6;
+    double computeTime = flops / (effectiveGpuCompute * 1e9 * utilization);
+    double memoryTime = memBytes / (config_.gpuMemoryBandwidth * 1e9 * coalescing);
     double transferTime = dataBytes / (config_.pcieBandwidth * 1e9);
 
-    return launchTime + computeTime + memoryTime + transferTime;
+    double reductionTime = summary.reductions.size() * config_.gpuReductionOverhead;
+
+    return launchTime + computeTime + memoryTime + transferTime + reductionTime;
 }
 
 ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary) {
@@ -120,6 +166,7 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
               << " computeHeavy=" << computeHeavy
               << " flops=" << summary.intensity.flopCount
               << " memOps=" << summary.intensity.memoryOpCount
+              << " accessPattern=" << accessPatternName(summary.intensity.accessPattern)
               << " cpuTime=" << cpuTime
               << " gpuTime=" << gpuTime
               << " speedup=" << speedup
