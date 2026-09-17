@@ -15,16 +15,18 @@ Usage:
 """
 import argparse
 import math
-import re
 import sys
 
 
 def load(path):
+    numbers = []
     with open(path) as f:
-        # Extract every floating-point / integer token so that labelled output
-        # (e.g. "checksum: 42.0") is handled the same as raw numbers.
-        tokens = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", f.read())
-        return [float(x) for x in tokens]
+        for token in f.read().split():
+            try:
+                numbers.append(float(token))
+            except ValueError:
+                pass
+    return numbers
 
 
 def isclose(a, b, rtol, atol):
