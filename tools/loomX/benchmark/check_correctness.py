@@ -19,8 +19,14 @@ import sys
 
 
 def load(path):
+    numbers = []
     with open(path) as f:
-        return [float(x) for x in f.read().split()]
+        for token in f.read().split():
+            try:
+                numbers.append(float(token))
+            except ValueError:
+                pass
+    return numbers
 
 
 def isclose(a, b, rtol, atol):
