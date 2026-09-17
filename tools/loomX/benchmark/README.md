@@ -66,6 +66,18 @@ LOCK_CLOCKS=yes \
 ./run_benchmarks.sh interproc-microbench
 ```
 
+The translator exposes several cost-model knobs.  Useful ones for tuning:
+
+```bash
+--min-gpu-speedup <f>          # minimum estimated speedup to choose GPU (default 1.2)
+--compute-bound-threshold <f>  # FLOPs per memory op to be "compute-bound" (default 8)
+--gpu-compute-efficiency <f>   # fraction of peak GPU FP throughput (default 0.5)
+--heavy-math-cost <f>          # penalty for sin/cos/sqrt/exp/log (default 8)
+--pcie-factor <f>              # fraction of memory traffic crossing PCIe (default 1.0)
+--cpu-cache-reuse <f>          # CPU cache-reuse factor for unit-stride accesses (default 0.25)
+--gpu-reduction-overhead <f>   # per-reduction GPU overhead in seconds (default 1e-6)
+```
+
 ## 3. Manual variant generation (optional)
 
 ```bash
