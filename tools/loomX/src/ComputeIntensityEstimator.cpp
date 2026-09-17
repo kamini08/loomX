@@ -35,6 +35,8 @@ ComputeIntensityResult ComputeIntensityEstimator::analyze(SgForStatement* loop,
         static_cast<double>(result.flopCount) /
         static_cast<double>(result.memoryOpCount);
 
+    result.accessPattern = classifyAccessPattern(loop);
+
     if (result.hasHeavyMath) {
         // Transcendentals/sqrt/log are expensive on most GPUs.
         result.classification = IntensityClass::COMPUTE_BOUND;
@@ -190,6 +192,129 @@ bool ComputeIntensityEstimator::isHeavyMathFunction(const std::string& name) {
         "sqrt", "cbrt", "pow", "hypot", "erf", "erfc", "tgamma", "lgamma"
     };
     return heavy.count(name) > 0;
+}
+
+// Collect index expressions from a (possibly multi-dimensional) array reference.
+// For A[i][k] this returns {i, k} in left-to-right order.
+static void collectArrayIndices(SgPntrArrRefExp* arrRef,
+                                std::vector<SgExpression*>& indices) {
+    if (!arrRef) return;
+    SgExpression* lhs = arrRef->get_lhs_operand();
+    SgExpression* rhs = arrRef->get_rhs_operand();
+    if (SgPntrArrRefExp* inner = isSgPntrArrRefExp(lhs)) {
+        collectArrayIndices(inner, indices);
+    }
+    indices.push_back(rhs);
+}
+
+AccessPattern ComputeIntensityEstimator::classifyAccessPattern(SgForStatement* loop) {
+    if (!loop) return AccessPattern::UNKNOWN;
+
+    const CanonicalResult& canonical = canonicalChecker_.analyze(loop);
+    SgInitializedName* loopVar = canonical.indexVar;
+    if (!loopVar) return AccessPattern::UNKNOWN;
+
+    AccessPattern worst = AccessPattern::UNKNOWN;
+
+    SgStatement* body = loop->get_loop_body();
+    Rose_STL_Container<SgNode*> arrRefs =
+        NodeQuery::querySubTree(body, V_SgPntrArrRefExp);
+
+    for (SgNode* node : arrRefs) {
+        SgPntrArrRefExp* arrRef = isSgPntrArrRefExp(node);
+        if (!arrRef) continue;
+
+        std::vector<SgExpression*> indices;
+        collectArrayIndices(arrRef, indices);
+        if (indices.empty()) continue;
+
+        // Determine which dimension the loop variable appears in.  In C the
+        // rightmost dimension is contiguous in memory.
+        bool loopVarFound = false;
+        bool inRightmost = false;
+        bool inOtherDimension = false;
+        bool complexIndex = false;
+
+        for (size_t d = 0; d < indices.size(); ++d) {
+            AccessPattern pat = classifyIndexExpression(indices[d], loopVar);
+            if (pat == AccessPattern::IRREGULAR) {
+                complexIndex = true;
+            } else if (pat == AccessPattern::UNIT_STRIDE ||
+                       pat == AccessPattern::STRIDED) {
+                loopVarFound = true;
+                if (d == indices.size() - 1) {
+                    inRightmost = true;
+                } else {
+                    inOtherDimension = true;
+                }
+            }
+        }
+
+        if (!loopVarFound) continue;
+
+        if (complexIndex) {
+            return AccessPattern::IRREGULAR;
+        }
+        if (inOtherDimension) {
+            worst = AccessPattern::STRIDED;
+        } else if (inRightmost) {
+            if (worst == AccessPattern::UNKNOWN) {
+                worst = AccessPattern::UNIT_STRIDE;
+            }
+        }
+    }
+
+    return worst;
+}
+
+AccessPattern ComputeIntensityEstimator::classifyIndexExpression(
+    SgExpression* index, SgInitializedName* loopVar) const {
+    if (!index || !loopVar) return AccessPattern::IRREGULAR;
+
+    index = skipCasts(index);
+
+    // Exactly the loop variable.
+    if (SgVarRefExp* varRef = isSgVarRefExp(index)) {
+        if (varRef->get_symbol()->get_declaration() == loopVar)
+            return AccessPattern::UNIT_STRIDE;
+        return AccessPattern::UNKNOWN;
+    }
+
+    // Binary expressions: look for loopVar * const, const * loopVar,
+    // loopVar + const, loopVar - const.
+    if (SgBinaryOp* binOp = isSgBinaryOp(index)) {
+        SgExpression* lhs = skipCasts(binOp->get_lhs_operand());
+        SgExpression* rhs = skipCasts(binOp->get_rhs_operand());
+
+        bool lhsIsLoopVar = false;
+        bool rhsIsLoopVar = false;
+        if (SgVarRefExp* v = isSgVarRefExp(lhs)) {
+            lhsIsLoopVar = (v->get_symbol()->get_declaration() == loopVar);
+        }
+        if (SgVarRefExp* v = isSgVarRefExp(rhs)) {
+            rhsIsLoopVar = (v->get_symbol()->get_declaration() == loopVar);
+        }
+
+        bool lhsIsConst = (isSgIntVal(lhs) || isSgLongIntVal(lhs) ||
+                           isSgLongLongIntVal(lhs));
+        bool rhsIsConst = (isSgIntVal(rhs) || isSgLongIntVal(rhs) ||
+                           isSgLongLongIntVal(rhs));
+
+        if (isSgAddOp(index) || isSgSubtractOp(index)) {
+            if ((lhsIsLoopVar && rhsIsConst) || (rhsIsLoopVar && lhsIsConst))
+                return AccessPattern::UNIT_STRIDE;
+        }
+        if (isSgMultiplyOp(index)) {
+            if ((lhsIsLoopVar && rhsIsConst) || (rhsIsLoopVar && lhsIsConst))
+                return AccessPattern::STRIDED;
+        }
+
+        // Loop variable in a more complex expression => irregular.
+        if (lhsIsLoopVar || rhsIsLoopVar) return AccessPattern::IRREGULAR;
+        return AccessPattern::UNKNOWN;
+    }
+
+    return AccessPattern::UNKNOWN;
 }
 
 } // namespace loomX

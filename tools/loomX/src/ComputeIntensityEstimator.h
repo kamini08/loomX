@@ -32,6 +32,14 @@ private:
     static bool isFloatingPointOp(SgBinaryOp* op);
     static bool isFloatingPointType(SgType* type);
     static bool isHeavyMathFunction(const std::string& name);
+
+    // Classify the dominant memory-access pattern in the loop body.
+    AccessPattern classifyAccessPattern(SgForStatement* loop);
+
+    // Return true if expr is exactly the loop iterator (possibly through a
+    // cast), a constant multiple of it (STRIDED), or something else.
+    AccessPattern classifyIndexExpression(SgExpression* index,
+                                          SgInitializedName* loopVar) const;
 };
 
 } // namespace loomX
