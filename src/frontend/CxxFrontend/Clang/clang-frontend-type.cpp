@@ -518,6 +518,7 @@ bool ClangToSageTranslator::VisitBuiltinType(clang::BuiltinType * builtin_type, 
         case clang::BuiltinType::Float:      *node = SageBuilder::buildFloatType();            break;
         case clang::BuiltinType::Double:     *node = SageBuilder::buildDoubleType();           break;
         case clang::BuiltinType::LongDouble: *node = SageBuilder::buildLongDoubleType();       break;
+        case clang::BuiltinType::Float128:   *node = SageBuilder::buildFloat128Type();         break;
 
         case clang::BuiltinType::Char_S:     *node = SageBuilder::buildCharType();             break;
 
