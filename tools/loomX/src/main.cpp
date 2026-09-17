@@ -219,12 +219,20 @@ loomX::LoopSummary buildSummary(SgForStatement* loop,
     return summary;
 }
 
+enum class TranslationMode {
+    CPU_ONLY,        // Force CPU OpenMP for all safe loops.
+    GPU_NAIVE,       // Offload every safe loop to GPU (profitability gate off).
+    GPU_PROFITABLE,  // Use profitability model to choose CPU vs GPU (default).
+};
+
 int main(int argc, char* argv[]) {
     ROSE_INITIALIZE;
 
     bool verbose = false;
     bool intraproceduralBaseline = false;
+    TranslationMode mode = TranslationMode::GPU_PROFITABLE;
     loomX::ProfitabilityConfig config;
+    std::string explicitOutputFile;
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
@@ -232,12 +240,20 @@ int main(int argc, char* argv[]) {
             verbose = true;
         } else if (arg == "--intraprocedural-baseline") {
             intraproceduralBaseline = true;
+        } else if (arg == "--cpu-only") {
+            mode = TranslationMode::CPU_ONLY;
+        } else if (arg == "--gpu-naive") {
+            mode = TranslationMode::GPU_NAIVE;
+        } else if (arg == "--gpu-profitable") {
+            mode = TranslationMode::GPU_PROFITABLE;
         } else if (arg == "--min-gpu-speedup" && i + 1 < argc) {
             config.minGpuSpeedup = std::stod(argv[++i]);
         } else if (arg == "--min-nested-flop" && i + 1 < argc) {
             config.minNestedFlopForGPU = std::stoll(argv[++i]);
         } else if (arg == "--compute-bound-threshold" && i + 1 < argc) {
             config.computeBoundThreshold = std::stod(argv[++i]);
+        } else if ((arg == "-o" || arg == "--output") && i + 1 < argc) {
+            explicitOutputFile = argv[++i];
         } else {
             args.push_back(arg);
         }
@@ -246,6 +262,7 @@ int main(int argc, char* argv[]) {
     if (args.empty()) {
         std::cerr << "Usage: " << argv[0]
                   << " [-v|--verbose] [--intraprocedural-baseline]"
+                  << " [--cpu-only|--gpu-naive|--gpu-profitable]"
                   << " [--min-gpu-speedup <f>] [--min-nested-flop <n>]"
                   << " [--compute-bound-threshold <f>] <input.c> [-o output.c]\n";
         return 1;
@@ -262,6 +279,17 @@ int main(int argc, char* argv[]) {
     if (!project) {
         std::cerr << "Failed to parse input\n";
         return 1;
+    }
+
+    // Honor -o / --output explicitly so the harness can name outputs.
+    if (!explicitOutputFile.empty()) {
+        SgFilePtrList& files = project->get_fileList();
+        if (!files.empty()) {
+            SgSourceFile* firstFile = isSgSourceFile(files[0]);
+            if (firstFile) {
+                firstFile->set_unparse_output_filename(explicitOutputFile);
+            }
+        }
     }
 
     // Step 1: Interprocedural analysis
@@ -332,6 +360,17 @@ int main(int argc, char* argv[]) {
         }
         if (summary.hasFunctionCalls && summary.allFunctionCallsSafe) {
             std::cout << "  -> All function calls are safe (interprocedural analysis)\n";
+        }
+
+        // Apply translation-mode override for ablation experiments.
+        if (mode == TranslationMode::CPU_ONLY) {
+            if (summary.target != ParallelTarget::SEQUENTIAL) {
+                summary.target = ParallelTarget::CPU_OPENMP;
+            }
+        } else if (mode == TranslationMode::GPU_NAIVE) {
+            if (summary.target != ParallelTarget::SEQUENTIAL) {
+                summary.target = ParallelTarget::GPU_OFFLOAD;
+            }
         }
 
         // Apply the cost-model decision.
