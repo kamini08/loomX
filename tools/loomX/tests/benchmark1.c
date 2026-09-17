@@ -1,6 +1,4 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
+#include "bench_minimal.h"
 
 // Leaf helper function: safe to call in parallel
 // Computes a simple arithmetic operation

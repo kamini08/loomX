@@ -24,6 +24,10 @@ fi
 
 for src in "$TEST_DIR"/*.c; do
     name="$(basename "$src" .c)"
+    # Skip previously transformed outputs and support headers.
+    if [[ "$name" == rose_* ]] || [[ "$name" == bench_minimal ]]; then
+        continue
+    fi
     echo "=== $name ==="
 
     # Run loomX.
@@ -35,7 +39,7 @@ for src in "$TEST_DIR"/*.c; do
     fi
 
     # Compile original.
-    if ! gcc -O2 -fopenmp "$src" -o "$WORK_DIR/${name}.orig" -lm >"$WORK_DIR/${name}.orig.build.log" 2>&1; then
+    if ! gcc -O2 -fopenmp -I"$TEST_DIR" "$src" -o "$WORK_DIR/${name}.orig" -lm >"$WORK_DIR/${name}.orig.build.log" 2>&1; then
         echo "  original build failed; see $WORK_DIR/${name}.orig.build.log"
         FAIL=$((FAIL + 1))
         FAILED_TESTS="$FAILED_TESTS $name(orig-build)"
@@ -43,7 +47,7 @@ for src in "$TEST_DIR"/*.c; do
     fi
 
     # Compile transformed.
-    if ! gcc -O2 -fopenmp "$WORK_DIR/rose_${name}.c" -o "$WORK_DIR/${name}.rose" -lm >"$WORK_DIR/${name}.rose.build.log" 2>&1; then
+    if ! gcc -O2 -fopenmp -I"$TEST_DIR" "$WORK_DIR/rose_${name}.c" -o "$WORK_DIR/${name}.rose" -lm >"$WORK_DIR/${name}.rose.build.log" 2>&1; then
         echo "  transformed build failed; see $WORK_DIR/${name}.rose.build.log"
         FAIL=$((FAIL + 1))
         FAILED_TESTS="$FAILED_TESTS $name(rose-build)"
