@@ -1,22 +1,3 @@
-#!/usr/bin/env python3
-"""
-check_dataracebench.py -- evaluate loomX's parallel-safety judgments against
-DataRaceBench's yes/no ground truth.
-
-DataRaceBench files are named like:
-    DRB###-name-orig-yes.c   -- contains a data race (loomX should reject)
-    DRB###-name-orig-no.c    -- race-free (loomX should accept)
-
-We run loomX on each file and count "accepted" (any OpenMP pragma inserted in
-a loop body) vs "rejected".  The script reports false positives, false
-negatives, and an overall accuracy score.
-
-Usage:
-    python3 check_dataracebench.py \
-        --loomx /path/to/loomX \
-        --suite /path/to/dataracebench/micro-benchmarks \
-        --output drb_results.csv
-"""
 import argparse
 import csv
 import os
@@ -26,14 +7,33 @@ import sys
 import tempfile
 
 
-def strip_existing_pragmas(src_path):
-    """Return a path to a temp file with existing #pragma omp directives removed.
+def find_hot_loop_lines(src_path):
+    """Return line numbers of for-loops originally preceded by #pragma omp."""
+    hot_lines = []
+    with open(src_path) as f:
+        lines = f.readlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.lstrip().startswith("#pragma omp"):
+            # Scan forward for the associated for-statement.
+            j = i + 1
+            while j < len(lines):
+                cur = lines[j].strip()
+                if not cur or cur.startswith("//"):
+                    j += 1
+                    continue
+                if cur.startswith("for ") or cur.startswith("for("):
+                    hot_lines.append(j + 1)  # 1-based line number
+                    break
+                break
+            i = j + 1 if j < len(lines) else i + 1
+        else:
+            i += 1
+    return hot_lines
 
-    DataRaceBench files ship with OpenMP pragmas that encode the intended
-    (safe or buggy) semantics. To measure loomX's own safety judgment, we
-    strip those pragmas before analysis and then check whether loomX chooses
-    to re-insert any.
-    """
+
+def strip_existing_pragmas(src_path):
     with open(src_path) as f:
         lines = f.readlines()
     stripped = [line for line in lines if not line.lstrip().startswith("#pragma omp")]
@@ -44,21 +44,11 @@ def strip_existing_pragmas(src_path):
 
 
 def run_loomx(loomx_path, src_path, mode="cpu-only", strict=False):
-    """Run loomX on src_path and return True if any loop was parallelized.
-
-    In strict mode, existing #pragma omp directives are removed first so the
-    verdict reflects loomX's own safety judgment.  In lenient mode (default),
-    the original pragmas are left in place and the scalar-dependence guard is
-    disabled, giving a higher acceptance rate at the cost of more false
-    positives from pre-existing buggy pragmas.
-
-    Output is written to a temporary directory so stale .loomx.c files do not
-    affect later runs or get scanned as DRB sources.
-    """
     input_path = src_path
     extra_args = []
     if strict:
         input_path = strip_existing_pragmas(src_path)
+        extra_args.append("--analyze-only")
     else:
         extra_args.append("--no-scalar-dep-check")
 
@@ -66,7 +56,7 @@ def run_loomx(loomx_path, src_path, mode="cpu-only", strict=False):
         with tempfile.TemporaryDirectory() as td:
             out_path = os.path.join(td, os.path.basename(src_path) + ".loomx.c")
             try:
-                subprocess.run(
+                proc = subprocess.run(
                     [loomx_path, f"--{mode}"] + extra_args + [input_path, "-o", out_path],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -77,13 +67,25 @@ def run_loomx(loomx_path, src_path, mode="cpu-only", strict=False):
                 print(f"  [warn] loomX failed on {src_path}: {e}", file=sys.stderr)
                 return False
 
-            if not os.path.exists(out_path):
-                return False
-
-            with open(out_path) as f:
-                content = f.read()
-            # A parallelized loop will contain an OpenMP pragma.
-            return "#pragma omp" in content
+            if strict:
+                # Strict mode: accept only if a loop originally marked parallel is
+                # now parallelized. This avoids counting init/checksum loops.
+                hot_lines = set(find_hot_loop_lines(src_path))
+                if not hot_lines:
+                    return False
+                stdout = proc.stdout.decode("utf-8", errors="ignore")
+                parallelized_lines = set()
+                for line in stdout.splitlines():
+                    m = re.match(r"PARALLELIZED line (\d+)", line.strip())
+                    if m:
+                        parallelized_lines.add(int(m.group(1)))
+                return bool(hot_lines & parallelized_lines)
+            else:
+                if not os.path.exists(out_path):
+                    return False
+                with open(out_path) as f:
+                    content = f.read()
+                return "#pragma omp" in content
     finally:
         if strict:
             try:
@@ -93,7 +95,6 @@ def run_loomx(loomx_path, src_path, mode="cpu-only", strict=False):
 
 
 def parse_label(filename):
-    """Return ('yes'|'no'|None, base_name) from a DRB filename."""
     m = re.match(r"(DRB\d+-.+)-(orig|omp)-(yes|no)\.c$", filename)
     if not m:
         return None, None
@@ -102,10 +103,10 @@ def parse_label(filename):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--loomx", required=True, help="path to loomX translator")
-    ap.add_argument("--suite", required=True, help="path to dataracebench micro-benchmarks dir")
-    ap.add_argument("--mode", default="cpu-only", help="loomX mode: cpu-only, gpu-naive, gpu-profitable")
-    ap.add_argument("--strict", action="store_true", help="strip input pragmas and enable scalar-dependence guard")
+    ap.add_argument("--loomx", required=True)
+    ap.add_argument("--suite", required=True)
+    ap.add_argument("--mode", default="cpu-only")
+    ap.add_argument("--strict", action="store_true")
     ap.add_argument("--output", default="dataracebench_results.csv")
     args = ap.parse_args()
 
@@ -150,7 +151,7 @@ def main():
         w.writeheader()
         w.writerows(results)
 
-    print(f"\nMode: {args.mode}")
+    print(f"\nMode: {args.mode} (strict={args.strict})")
     print(f"Total evaluated: {total}")
     print(f"Correct:         {correct} ({100.0*correct/total:.1f}%)" if total else "N/A")
     print(f"False positives (accepted a -yes race): {len(false_positives)}")
@@ -164,7 +165,7 @@ def main():
             print(f"  {f}")
     if false_negatives:
         print("\nFalse negatives:")
-        for f in false_negatives[:20]:  # truncate long lists
+        for f in false_negatives[:20]:
             print(f"  {f}")
         if len(false_negatives) > 20:
             print(f"  ... and {len(false_negatives) - 20} more")

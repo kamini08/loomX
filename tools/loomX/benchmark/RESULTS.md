@@ -123,7 +123,25 @@ Confusion matrix:
 -no  (safe)        28       38
 ```
 
-The false-positive count drops from **50 to 26**, but the false-negative count rises because many `-no` cases are safe only under OpenMP constructs (`task`, `sections`, `simd`, `atomic`, `barrier`, etc.) that are removed during stripping; handling those constructs is the next step.
+The false-positive count drops from **50 to 26**, but the false-negative count rises because many `-no` cases are safe only under OpenMP constructs (`task`, `sections`, `simd`, `atomic`, `barrier`, etc.) that are removed during stripping.
+
+### Strict hot-loop evaluation (`--strict` with per-loop matching)
+
+The harness was further refined to use loomX's new `--analyze-only` mode and to compare verdicts only for the loop that originally carried the OpenMP pragma. This avoids counting safe init/checksum loops as acceptances.
+
+```
+Total evaluated: 117
+Correct:         56 (47.9%)
+False positives (accepted a -yes race): 1
+False negatives (rejected a -no safe case): 60
+
+Confusion matrix:
+                accepted  rejected
+-yes (unsafe)       1       50
+-no  (safe)         6       60
+```
+
+With this methodology the pipeline parallelizes **only one unsafe hot loop** (DRB073-doall2-orig-yes, where loomX automatically supplies the missing `private(j)` clause). All other `-yes` races are rejected, which prioritizes correctness over parallelism.
 
 ## 4. What is missing for the full claims
 

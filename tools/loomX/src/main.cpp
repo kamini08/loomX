@@ -344,6 +344,7 @@ enum class TranslationMode {
     CPU_ONLY,        // Force CPU OpenMP for all safe loops.
     GPU_NAIVE,       // Offload every safe loop to GPU (profitability gate off).
     GPU_PROFITABLE,  // Use profitability model to choose CPU vs GPU (default).
+    ANALYZE_ONLY,    // Report per-loop verdicts without transforming the source.
 };
 
 int main(int argc, char* argv[]) {
@@ -370,6 +371,8 @@ int main(int argc, char* argv[]) {
             mode = TranslationMode::GPU_NAIVE;
         } else if (arg == "--gpu-profitable") {
             mode = TranslationMode::GPU_PROFITABLE;
+        } else if (arg == "--analyze-only") {
+            mode = TranslationMode::ANALYZE_ONLY;
         } else if (arg == "--min-gpu-speedup" && i + 1 < argc) {
             config.minGpuSpeedup = std::stod(argv[++i]);
         } else if (arg == "--min-nested-flop" && i + 1 < argc) {
@@ -398,7 +401,7 @@ int main(int argc, char* argv[]) {
     if (args.empty()) {
         std::cerr << "Usage: " << argv[0]
                   << " [-v|--verbose] [--intraprocedural-baseline] [--no-scalar-dep-check]"
-                  << " [--cpu-only|--gpu-naive|--gpu-profitable]"
+                  << " [--cpu-only|--gpu-naive|--gpu-profitable|--analyze-only]"
                   << " [--min-gpu-speedup <f>] [--min-nested-flop <n>]"
                   << " [--min-total-flop <n>] [--compute-bound-threshold <f>]"
                   << " <input.c> [-o output.c]\n";
@@ -523,8 +526,28 @@ int main(int argc, char* argv[]) {
 
         // Apply the cost-model decision.
         if (summary.target == ParallelTarget::SEQUENTIAL) {
-            std::cout << "  -> Not profitable to parallelize\n";
+            if (mode == TranslationMode::ANALYZE_ONLY) {
+                std::cout << "REJECTED line "
+                          << loop->get_file_info()->get_line()
+                          << ": not profitable / not safe\n";
+            } else {
+                std::cout << "  -> Not profitable to parallelize\n";
+            }
             skipped++;
+            continue;
+        }
+
+        // In analyze-only mode we report the verdict and stop.
+        if (mode == TranslationMode::ANALYZE_ONLY) {
+            std::cout << "PARALLELIZED line "
+                      << loop->get_file_info()->get_line();
+            if (summary.target == ParallelTarget::GPU_OFFLOAD) {
+                std::cout << " GPU_OFFLOAD";
+            } else {
+                std::cout << " CPU_OPENMP";
+            }
+            std::cout << "\n";
+            parallelized++;
             continue;
         }
 
@@ -545,13 +568,15 @@ int main(int argc, char* argv[]) {
     std::cout << "Parallelized: " << parallelized << "\n";
     std::cout << "Skipped: " << skipped << "\n";
 
-    // Generate output
-    project->unparse();
+    // Generate output (skipped in analyze-only mode).
+    if (mode != TranslationMode::ANALYZE_ONLY) {
+        project->unparse();
+    }
 
     // Post-process the unparsed source:
     //   1. Hoist target data regions around consecutive GPU loops.
     //   2. Prepend #include <omp.h> if not already present.
-    if (parallelized > 0) {
+    if (mode != TranslationMode::ANALYZE_ONLY && parallelized > 0) {
         SgFilePtrList& files = project->get_fileList();
         if (!files.empty()) {
             SgSourceFile* firstFile = isSgSourceFile(files[0]);
