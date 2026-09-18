@@ -1,9 +1,0 @@
-# Benchmark harness generated artifacts
-bench-suites/
-out/
-bin/
-results/
-*.csv
-*.out
-*.nsys-rep
-*.sqlite
