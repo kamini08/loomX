@@ -3343,7 +3343,15 @@ bool ClangToSageTranslator::VisitGenericSelectionExpr(clang::GenericSelectionExp
 #endif
     bool res = true;
 
-    // TODO
+    // _Generic resolves to a single association expression at compile time.
+    // Translate the selected result expression so downstream analyses see
+    // the actual value being used.
+    if (!generic_Selection_expr->isResultDependent()) {
+        clang::Expr * result_expr = generic_Selection_expr->getResultExpr();
+        if (result_expr != NULL) {
+            *node = Traverse(result_expr);
+        }
+    }
 
     return VisitExpr(generic_Selection_expr, node) && res;
 }
@@ -3354,7 +3362,7 @@ bool ClangToSageTranslator::VisitGNUNullExpr(clang::GNUNullExpr * gnu_null_expr,
 #endif
     bool res = true;
 
-    // TODO
+    *node = SageBuilder::buildNullExpression();
 
     return VisitExpr(gnu_null_expr, node) && res;
 }

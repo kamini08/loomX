@@ -338,6 +338,10 @@ SgNode * ClangToSageTranslator::Traverse(clang::Decl * decl) {
             ret_status = VisitUsingPackDecl((clang::UsingPackDecl *)decl, &result);
             ROSE_ASSERT(ret_status == false || result != NULL);
             break;
+        case clang::Decl::UsingShadow:
+            ret_status = VisitUsingShadowDecl((clang::UsingShadowDecl *)decl, &result);
+            ROSE_ASSERT(ret_status == false || result != NULL);
+            break;
         case clang::Decl::ConstructorUsingShadow:
             ret_status = VisitConstructorUsingShadowDecl((clang::ConstructorUsingShadowDecl *)decl, &result);
             ROSE_ASSERT(ret_status == false || result != NULL);
@@ -1006,7 +1010,17 @@ bool ClangToSageTranslator::VisitFunctionTemplateDecl(clang::FunctionTemplateDec
 #endif
     bool res = true;
 
-    ROSE_ASSERT(FAIL_TODO == 0); // TODO
+    // For now, translate the underlying (templated) function declaration.
+    // Full template support would require SgTemplateFunctionDeclaration,
+    // but Rodinia-style C++ code only needs the concrete function to be
+    // visible for loop parallelisation analysis.
+    clang::FunctionDecl * templated = function_template_decl->getTemplatedDecl();
+    if (templated != NULL) {
+        SgNode * templated_node = Traverse(templated);
+        if (templated_node != NULL) {
+            *node = templated_node;
+        }
+    }
 
     return VisitRedeclarableTemplateDecl(function_template_decl, node) && res;
 }
@@ -1876,7 +1890,15 @@ bool ClangToSageTranslator::VisitUsingShadowDecl(clang::UsingShadowDecl * using_
 #endif  
     bool res = true;
 
-    ROSE_ASSERT(FAIL_FIXME == 0); // FIXME
+    // A using-shadow declaration just re-introduces an existing declaration
+    // into the current scope. Translate the target declaration and reuse it.
+    clang::NamedDecl * target = using_shadow_decl->getTargetDecl();
+    if (target != NULL) {
+        SgNode * target_node = Traverse(target);
+        if (target_node != NULL) {
+            *node = target_node;
+        }
+    }
 
     return VisitNamedDecl(using_shadow_decl, node) && res;
 }
@@ -1887,7 +1909,13 @@ bool ClangToSageTranslator::VisitConstructorUsingShadowDecl(clang::ConstructorUs
 #endif  
     bool res = true;
 
-    ROSE_ASSERT(FAIL_FIXME == 0); // FIXME
+    clang::NamedDecl * target = constructor_using_shadow_decl->getTargetDecl();
+    if (target != NULL) {
+        SgNode * target_node = Traverse(target);
+        if (target_node != NULL) {
+            *node = target_node;
+        }
+    }
 
     return VisitNamedDecl(constructor_using_shadow_decl, node) && res;
 }
@@ -3168,8 +3196,25 @@ bool ClangToSageTranslator::VisitLinkageSpecDecl(clang::LinkageSpecDecl * linkag
 #endif
     bool res = true;
 
-    ROSE_ASSERT(FAIL_TODO == 0); // TODO
+    // Flatten the linkage-spec declarations into the current scope.
+    // ROSE does not model C++ linkage specs, but we still need the
+    // nested declarations (e.g. extern "C" functions from libstdc++
+    // headers) to appear in the enclosing AST scope.
+    SgScopeStatement * scope = SageBuilder::topScopeStack();
+    clang::DeclContext * decl_context = (clang::DeclContext *)linkage_spec_decl;
+    clang::DeclContext::decl_iterator it;
+    for (it = decl_context->decls_begin(); it != decl_context->decls_end(); ++it) {
+        clang::Decl * child = *it;
+        if (child == nullptr) continue;
+        SgNode * child_node = Traverse(child);
+        SgDeclarationStatement * decl_stmt = isSgDeclarationStatement(child_node);
+        if (decl_stmt != NULL && scope != NULL) {
+            scope->getDeclarationList().push_back(decl_stmt);
+            decl_stmt->set_parent(scope);
+        }
+    }
 
+    *node = SageBuilder::buildEmptyDeclaration();
     return VisitDecl(linkage_spec_decl, node) && res;
 }
 

@@ -560,6 +560,7 @@ class ClangToSageTranslator : public clang::ASTConsumer {
             virtual bool VisitTemplateSpecializationType(clang::TemplateSpecializationType * template_specialization_type, SgNode ** node);
             virtual bool VisitTemplateTypeParmType(clang::TemplateTypeParmType * template_type_parm_type, SgNode ** node);
             virtual bool VisitTypedefType(clang::TypedefType * typedef_type, SgNode ** node);
+            virtual bool VisitUsingType(clang::UsingType * using_type, SgNode ** node);
             virtual bool VisitTypeOfExprType(clang::TypeOfExprType * type_of_expr_type, SgNode ** node);
                 virtual bool VisitDependentTypeOfExprType(clang::DependentTypeOfExprType * dependent_type_of_expr_type, SgNode ** node);
             virtual bool VisitTypeOfType(clang::TypeOfType * type_of_type, SgNode ** node);
