@@ -313,17 +313,37 @@ bool InterproceduralAnalysis::isFunctionSafe(const std::string& funcName) const 
 }
 
 void InterproceduralAnalysis::printSummaries(std::ostream& out) const {
-    out << "=== loomX Interprocedural Analysis Summaries ===\n";
+    // In intraprocedural-baseline mode the user is explicitly asking for a
+    // function-level summary. In normal mode we still print it, but only for
+    // functions that have definitions so the output is not dominated by the
+    // hundreds of standard-library declarations pulled in by system headers.
+    std::vector<const FunctionSummary*> definedSummaries;
     for (const auto& entry : summaries_) {
-        const FunctionSummary& s = entry.second;
+        if (entry.second.hasDefinition) {
+            definedSummaries.push_back(&entry.second);
+        }
+    }
+
+    if (intraproceduralBaseline_) {
+        out << "=== loomX Intraprocedural Analysis Summaries ===\n";
+    } else {
+        out << "=== loomX Interprocedural Analysis Summaries ===\n";
+    }
+    out << "Analyzed " << definedSummaries.size() << " user-defined function(s)\n";
+
+    for (const FunctionSummary* sp : definedSummaries) {
+        const FunctionSummary& s = *sp;
         out << "Function: " << s.name << "\n";
         out << "  hasDefinition: " << s.hasDefinition
             << "  isLeaf: " << s.isLeaf
             << "  inCycle: " << s.inRecursiveCycle << "\n";
         out << "  local IO: " << s.hasIOSideEffects
             << "  local global-write: " << s.hasGlobalWrites
-            << "  local pointer-write: " << s.writesThroughPointer
-            << "  transitive side-effects: " << s.hasTransitiveSideEffects << "\n";
+            << "  local pointer-write: " << s.writesThroughPointer;
+        if (!intraproceduralBaseline_) {
+            out << "  transitive side-effects: " << s.hasTransitiveSideEffects;
+        }
+        out << "\n";
         out << "  readParams: {";
         for (int p : s.readParams) out << p << " ";
         out << "} writtenParams: {";
@@ -341,9 +361,11 @@ void InterproceduralAnalysis::printSummaries(std::ostream& out) const {
             }
             out << "}\n";
         }
-        out << "  callees: {";
-        for (const std::string& c : s.callees) out << c << " ";
-        out << "}\n";
+        if (!intraproceduralBaseline_) {
+            out << "  callees: {";
+            for (const std::string& c : s.callees) out << c << " ";
+            out << "}\n";
+        }
         out << "  SAFE for parallel loop: " << (isFunctionSafe(s.name) ? "YES" : "NO") << "\n\n";
     }
 }

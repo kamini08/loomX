@@ -670,7 +670,7 @@ int main(int argc, char* argv[]) {
     InterproceduralAnalysis ipa;
     ipa.setIntraproceduralBaseline(intraproceduralBaseline);
     ipa.analyzeProject(project);
-    if (verbose) {
+    if (verbose || intraproceduralBaseline) {
         std::cout << "\n";
         ipa.printSummaries();
     }
