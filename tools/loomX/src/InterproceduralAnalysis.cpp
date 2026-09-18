@@ -13,11 +13,17 @@
 static const std::set<std::string>& getPureStdlibFunctions() {
     static const std::set<std::string> pure = {
         // C math library (cmath/math.h)
-        "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
-        "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
-        "exp", "exp2", "expm1", "log", "log2", "log10", "log1p",
-        "sqrt", "cbrt", "fabs", "ceil", "floor", "round", "trunc",
-        "fmod", "remainder", "pow", "hypot", "ldexp", "scalbn",
+        "sin", "sinf", "cos", "cosf", "tan", "tanf",
+        "asin", "asinf", "acos", "acosf", "atan", "atanf", "atan2", "atan2f",
+        "sinh", "sinhf", "cosh", "coshf", "tanh", "tanhf",
+        "asinh", "asinhf", "acosh", "acoshf", "atanh", "atanhf",
+        "exp", "expf", "exp2", "exp2f", "expm1", "expm1f",
+        "log", "logf", "log2", "log2f", "log10", "log10f", "log1p", "log1pf",
+        "sqrt", "sqrtf", "cbrt", "cbrtf", "fabs", "fabsf", "ceil", "ceilf",
+        "floor", "floorf", "round", "roundf", "trunc", "truncf",
+        "fmod", "fmodf", "remainder", "remainderf", "pow", "powf",
+        "hypot", "hypotf", "ldexp", "ldexpf", "scalbn", "scalbnf",
+        "fmax", "fmaxf", "fmin", "fminf",
         // Type conversions / limits
         "abs", "labs", "llabs",
         // Read-only string inspection
