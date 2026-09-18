@@ -19,6 +19,7 @@ public:
 private:
     ReductionOp detectCompoundAssignOp(SgCompoundAssignOp* op);
     ReductionOp detectBinaryReductionOp(SgInitializedName* var, SgExpression* rhs);
+    ReductionOp detectArrayElementReductionOp(SgAssignOp* assign, SgInitializedName* baseVar);
     ReductionOp detectMinMaxOp(SgInitializedName* var, SgExpression* rhs, bool isAssignment);
     std::string opToString(ReductionOp op);
     bool exprContainsVar(SgExpression* expr, SgInitializedName* var);

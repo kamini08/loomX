@@ -121,9 +121,11 @@ void OpenMPCodeGen::insertDeclareTargetPragmas(const loomX::LoopSummary& summary
     }
 }
 
-// Build a mapped variable reference. For arrays with a known constant size,
-// emit an array section (e.g., "A[0:1024]"). For pointers or arrays whose
-// size cannot be determined, fall back to the bare variable name.
+// Build a mapped variable reference. For arrays with known constant sizes,
+// emit a flat array section covering the whole allocation (e.g. "A[0:1024]").
+// Multi-dimensional arrays are flattened to a single element count. Pointers
+// or arrays whose size cannot be determined fall back to the bare variable
+// name.
 static std::string buildMappedVarName(SgInitializedName* var) {
     if (!var) return "";
 
@@ -135,12 +137,25 @@ static std::string buildMappedVarName(SgInitializedName* var) {
     SgArrayType* arrType = isSgArrayType(type);
     if (!arrType) return name;
 
-    SgExpression* index = arrType->get_index();
-    if (!index) return name;
+    // Multiply all dimensions to get the total element count.
+    std::string sizeStr;
+    while (arrType) {
+        SgExpression* index = arrType->get_index();
+        if (!index) return name;
+        std::string dim = index->unparseToString();
+        if (dim.empty()) return name;
+        if (sizeStr.empty()) {
+            sizeStr = dim;
+        } else {
+            sizeStr = "(" + sizeStr + ") * (" + dim + ")";
+        }
+        SgType* baseType = arrType->get_base_type();
+        if (!baseType) break;
+        baseType = baseType->stripType(SgType::STRIP_MODIFIER_TYPE | SgType::STRIP_TYPEDEF_TYPE);
+        arrType = isSgArrayType(baseType);
+    }
 
-    std::string sizeStr = index->unparseToString();
     if (sizeStr.empty()) return name;
-
     return name + "[0:" + sizeStr + "]";
 }
 
@@ -187,7 +202,11 @@ std::string OpenMPCodeGen::buildReductionClause(
     for (const loomX::ReductionInfo& info : reductionDetails) {
         if (!info.variable) continue;
         std::string op = info.opString.empty() ? "+" : info.opString;
-        groups[op].push_back(info.variable->get_name().getString());
+        std::string varName = info.variable->get_name().getString();
+        if (info.isArrayElement && info.arrayIndex) {
+            varName += "[" + info.arrayIndex->unparseToString() + "]";
+        }
+        groups[op].push_back(varName);
     }
 
     std::ostringstream oss;

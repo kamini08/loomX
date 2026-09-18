@@ -44,6 +44,52 @@ SgInitializedName* getBaseVariable(SgExpression* expr) {
     return varRef->get_symbol()->get_declaration();
 }
 
+// Collect the index variables of all for-loops nested immediately or deeply
+// inside the given loop body.
+std::set<SgInitializedName*> collectNestedLoopIndexVariables(SgForStatement* loop) {
+    std::set<SgInitializedName*> vars;
+    if (!loop) return vars;
+    SgStatement* body = loop->get_loop_body();
+    if (!body) return vars;
+
+    Rose_STL_Container<SgNode*> nestedLoops =
+        NodeQuery::querySubTree(body, V_SgForStatement);
+    for (SgNode* node : nestedLoops) {
+        if (SgForStatement* nested = isSgForStatement(node)) {
+            if (nested == loop) continue;
+            if (SgInitializedName* iv = SageInterface::getLoopIndexVariable(nested)) {
+                vars.insert(iv);
+            }
+        }
+    }
+    return vars;
+}
+
+// True if expr references var.
+bool subscriptContainsVar(SgExpression* expr, SgInitializedName* var) {
+    if (!expr || !var) return false;
+    Rose_STL_Container<SgNode*> refs = NodeQuery::querySubTree(expr, V_SgVarRefExp);
+    for (SgNode* node : refs) {
+        SgVarRefExp* ref = isSgVarRefExp(node);
+        if (ref && ref->get_symbol()->get_declaration() == var) return true;
+    }
+    return false;
+}
+
+// True if expr references at least one variable from nestedLoopVars.
+bool subscriptContainsAnyNestedLoopVar(
+    SgExpression* expr,
+    const std::set<SgInitializedName*>& nestedLoopVars) {
+    if (!expr || nestedLoopVars.empty()) return false;
+    Rose_STL_Container<SgNode*> refs = NodeQuery::querySubTree(expr, V_SgVarRefExp);
+    for (SgNode* node : refs) {
+        SgVarRefExp* ref = isSgVarRefExp(node);
+        if (ref && nestedLoopVars.find(ref->get_symbol()->get_declaration()) != nestedLoopVars.end())
+            return true;
+    }
+    return false;
+}
+
 } // anonymous namespace
 
 DependenceResult LoopDependenceAnalysis::analyze(SgForStatement* loop) {
@@ -62,6 +108,31 @@ DependenceResult LoopDependenceAnalysis::analyze(SgForStatement* loop) {
     }
 
     std::vector<ArrayReference> refs = collectArrayReferences(loop);
+
+    // Conservative guard: if a write reference inside this loop is indexed by
+    // a nested loop variable and the current loop variable does not appear in
+    // any of its subscripts, different iterations of the current loop may touch
+    // the same element.  Treat that as a loop-carried dependence so we don't
+    // parallelize outer loops that contain reductions over inner-loop indices
+    // (e.g. PolyBench atax/bicg).
+    std::set<SgInitializedName*> nestedLoopVars = collectNestedLoopIndexVariables(loop);
+    for (const ArrayReference& ref : refs) {
+        if (!ref.isWrite) continue;
+        if (!ref.baseVariable) continue;
+        bool currentLoopVarInAnySubscript = false;
+        bool nestedLoopVarInAnySubscript = false;
+        for (SgExpression* sub : ref.subscripts) {
+            if (subscriptContainsVar(sub, loopVar)) currentLoopVarInAnySubscript = true;
+            if (subscriptContainsAnyNestedLoopVar(sub, nestedLoopVars)) nestedLoopVarInAnySubscript = true;
+        }
+        if (!currentLoopVarInAnySubscript && nestedLoopVarInAnySubscript) {
+            result.hasLoopCarriedDependence = true;
+            result.description = "write indexed by nested loop variable on " +
+                                 ref.baseVariable->get_name().getString();
+            result.source = ref.subscripts.empty() ? nullptr : ref.subscripts.front();
+            return result;
+        }
+    }
 
     for (size_t i = 0; i < refs.size(); ++i) {
         for (size_t j = i + 1; j < refs.size(); ++j) {

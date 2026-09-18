@@ -3,6 +3,38 @@
 
 namespace loomX {
 
+namespace {
+
+// If expr is a loop-invariant array element access (arr[idx] where none of
+// the subscripts contain loopVar), return the base variable and the index
+// expression of the outermost dimension.  Otherwise return nullptr.
+std::pair<SgInitializedName*, SgExpression*>
+isLoopInvariantArrayElement(SgExpression* expr, SgInitializedName* loopVar) {
+    if (!expr || !loopVar) return {nullptr, nullptr};
+    SgPntrArrRefExp* arrRef = isSgPntrArrRefExp(expr);
+    if (!arrRef) return {nullptr, nullptr};
+
+    // The loop variable must not appear anywhere in the full array subscript.
+    Rose_STL_Container<SgNode*> allRefs =
+        NodeQuery::querySubTree(arrRef, V_SgVarRefExp);
+    for (SgNode* node : allRefs) {
+        SgVarRefExp* ref = isSgVarRefExp(node);
+        if (ref && ref->get_symbol()->get_declaration() == loopVar) {
+            return {nullptr, nullptr};
+        }
+    }
+
+    SgExpression* base = arrRef->get_lhs_operand();
+    while (SgPntrArrRefExp* nested = isSgPntrArrRefExp(base)) {
+        base = nested->get_lhs_operand();
+    }
+    SgVarRefExp* baseVar = isSgVarRefExp(base);
+    if (!baseVar) return {nullptr, nullptr};
+    return {baseVar->get_symbol()->get_declaration(), arrRef->get_rhs_operand()};
+}
+
+} // anonymous namespace
+
 std::vector<ReductionInfo> ReductionDetector::analyze(SgForStatement* loop) {
     std::vector<ReductionInfo> results;
     if (!loop) return results;
@@ -25,16 +57,34 @@ std::vector<ReductionInfo> ReductionDetector::analyze(SgForStatement* loop) {
         // Case 1: compound assignment +=, -=, *=, /=, &=, |=, ^=
         if (SgCompoundAssignOp* compound = isSgCompoundAssignOp(expr)) {
             SgExpression* lhs = compound->get_lhs_operand();
-            SgVarRefExp* lhsVar = isSgVarRefExp(skipCasts(lhs));
-            if (!lhsVar) continue;
 
-            info.variable = lhsVar->get_symbol()->get_declaration();
-            if (isLoopLocalVariable(info.variable, loop)) continue;
+            // Scalar reduction.
+            if (SgVarRefExp* lhsVar = isSgVarRefExp(skipCasts(lhs))) {
+                info.variable = lhsVar->get_symbol()->get_declaration();
+                if (!isLoopLocalVariable(info.variable, loop)) {
+                    info.op = detectCompoundAssignOp(compound);
+                    if (info.op != ReductionOp::UNKNOWN) {
+                        info.opString = opToString(info.op);
+                        results.push_back(info);
+                    }
+                }
+                continue;
+            }
 
-            info.op = detectCompoundAssignOp(compound);
-            if (info.op != ReductionOp::UNKNOWN) {
-                info.opString = opToString(info.op);
-                results.push_back(info);
+            // Loop-invariant array element reduction, e.g. tmp[i] += ...
+            // inside a loop over j.
+            if (SgInitializedName* loopVar = SageInterface::getLoopIndexVariable(loop)) {
+                auto arrElem = isLoopInvariantArrayElement(lhs, loopVar);
+                if (arrElem.first && !isLoopLocalVariable(arrElem.first, loop)) {
+                    info.variable = arrElem.first;
+                    info.isArrayElement = true;
+                    info.arrayIndex = arrElem.second;
+                    info.op = detectCompoundAssignOp(compound);
+                    if (info.op != ReductionOp::UNKNOWN) {
+                        info.opString = opToString(info.op);
+                        results.push_back(info);
+                    }
+                }
             }
             continue;
         }
@@ -44,11 +94,30 @@ std::vector<ReductionInfo> ReductionDetector::analyze(SgForStatement* loop) {
             SgInitializedName* var = nullptr;
             ReductionOp op = ReductionOp::UNKNOWN;
             if (isReductionAssignment(assign, var, op)) {
-                if (isLoopLocalVariable(var, loop)) continue;
-                info.variable = var;
-                info.op = op;
-                info.opString = opToString(op);
-                results.push_back(info);
+                if (!isLoopLocalVariable(var, loop)) {
+                    info.variable = var;
+                    info.op = op;
+                    info.opString = opToString(op);
+                    results.push_back(info);
+                }
+                continue;
+            }
+
+            // Loop-invariant array element assignment, e.g. tmp[i] = tmp[i] + ...
+            if (SgInitializedName* loopVar = SageInterface::getLoopIndexVariable(loop)) {
+                SgExpression* lhs = assign->get_lhs_operand();
+                auto arrElem = isLoopInvariantArrayElement(lhs, loopVar);
+                if (arrElem.first && !isLoopLocalVariable(arrElem.first, loop)) {
+                    ReductionOp arrOp = detectArrayElementReductionOp(assign, arrElem.first);
+                    if (arrOp != ReductionOp::UNKNOWN) {
+                        info.variable = arrElem.first;
+                        info.isArrayElement = true;
+                        info.arrayIndex = arrElem.second;
+                        info.op = arrOp;
+                        info.opString = opToString(arrOp);
+                        results.push_back(info);
+                    }
+                }
             }
             continue;
         }
@@ -139,6 +208,78 @@ ReductionOp ReductionDetector::detectBinaryReductionOp(SgInitializedName* var,
     if (SgBitXorOp* bxor = isSgBitXorOp(rhs)) {
         if (exprContainsVar(bxor->get_lhs_operand(), var) ||
             exprContainsVar(bxor->get_rhs_operand(), var)) {
+            return ReductionOp::BIT_XOR;
+        }
+    }
+
+    return ReductionOp::UNKNOWN;
+}
+
+// Check whether assign is of the form arr[idx] = arr[idx] op rhs where
+// arr[idx] is the same array element on both sides.  Only associative ops
+// are treated as reductions.
+ReductionOp ReductionDetector::detectArrayElementReductionOp(
+    SgAssignOp* assign, SgInitializedName* baseVar) {
+    if (!assign || !baseVar) return ReductionOp::UNKNOWN;
+
+    SgExpression* lhs = assign->get_lhs_operand();
+    SgExpression* rhs = assign->get_rhs_operand();
+
+    // The RHS must contain the same array element.
+    Rose_STL_Container<SgNode*> refs = NodeQuery::querySubTree(rhs, V_SgPntrArrRefExp);
+    bool foundMatch = false;
+    for (SgNode* node : refs) {
+        SgPntrArrRefExp* arrRef = isSgPntrArrRefExp(node);
+        if (!arrRef) continue;
+        SgExpression* base = arrRef->get_lhs_operand();
+        while (SgPntrArrRefExp* nested = isSgPntrArrRefExp(base)) {
+            base = nested->get_lhs_operand();
+        }
+        SgVarRefExp* baseVarRef = isSgVarRefExp(base);
+        if (baseVarRef && baseVarRef->get_symbol()->get_declaration() == baseVar) {
+        // Simple structural equality of the full array reference is
+        // sufficient for the common case (tmp[i] on both sides).
+        if (arrRef->unparseToString() == lhs->unparseToString()) {
+            foundMatch = true;
+            break;
+        }
+        }
+    }
+    if (!foundMatch) return ReductionOp::UNKNOWN;
+
+    // Determine the operator from the RHS shape.
+    if (SgAddOp* add = isSgAddOp(rhs)) {
+        if (exprContainsVar(add->get_lhs_operand(), baseVar) ||
+            exprContainsVar(add->get_rhs_operand(), baseVar)) {
+            return ReductionOp::ADD;
+        }
+    }
+    if (SgSubtractOp* sub = isSgSubtractOp(rhs)) {
+        if (exprContainsVar(sub->get_lhs_operand(), baseVar)) {
+            return ReductionOp::SUB;
+        }
+    }
+    if (SgMultiplyOp* mul = isSgMultiplyOp(rhs)) {
+        if (exprContainsVar(mul->get_lhs_operand(), baseVar) ||
+            exprContainsVar(mul->get_rhs_operand(), baseVar)) {
+            return ReductionOp::MUL;
+        }
+    }
+    if (SgBitAndOp* band = isSgBitAndOp(rhs)) {
+        if (exprContainsVar(band->get_lhs_operand(), baseVar) ||
+            exprContainsVar(band->get_rhs_operand(), baseVar)) {
+            return ReductionOp::BIT_AND;
+        }
+    }
+    if (SgBitOrOp* bor = isSgBitOrOp(rhs)) {
+        if (exprContainsVar(bor->get_lhs_operand(), baseVar) ||
+            exprContainsVar(bor->get_rhs_operand(), baseVar)) {
+            return ReductionOp::BIT_OR;
+        }
+    }
+    if (SgBitXorOp* bxor = isSgBitXorOp(rhs)) {
+        if (exprContainsVar(bxor->get_lhs_operand(), baseVar) ||
+            exprContainsVar(bxor->get_rhs_operand(), baseVar)) {
             return ReductionOp::BIT_XOR;
         }
     }

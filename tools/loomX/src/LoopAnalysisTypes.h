@@ -147,6 +147,8 @@ struct ReductionInfo {
     ReductionOp op = ReductionOp::UNKNOWN;
     std::string opString;  // OpenMP reduction operator string
     SgStatement* statement = nullptr;  // Statement where reduction was detected
+    bool isArrayElement = false;       // True if the reduction is on arr[idx]
+    SgExpression* arrayIndex = nullptr; // Index expression when isArrayElement is true
 };
 
 // Divergence classification.

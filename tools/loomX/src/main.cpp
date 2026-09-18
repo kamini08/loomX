@@ -125,6 +125,20 @@ static SgStatement* getEnclosingStatement(SgNode* node) {
     return isSgStatement(node);
 }
 
+// Return the name of the function that contains the given node, or an empty
+// string if the node is not inside a function definition.
+static std::string getEnclosingFunctionName(SgNode* node) {
+    while (node) {
+        if (SgFunctionDefinition* def = isSgFunctionDefinition(node)) {
+            SgFunctionDeclaration* decl = def->get_declaration();
+            if (decl) return decl->get_name().getString();
+            return "";
+        }
+        node = node->get_parent();
+    }
+    return "";
+}
+
 // Check for loop-carried dependences through scalar variables that are not
 // recognized as reductions.
 //
@@ -284,12 +298,18 @@ static bool hasScalarLoopCarriedDependence(SgForStatement* loop,
 }
 
 // Fill private-variable information for the summary.
-// Loop-index variables are implicitly private in OpenMP parallel-for and must
-// not be listed when declared in the for-init statement, because the pragma is
-// inserted outside the loop's scope.  Variables declared inside the loop body
-// or any nested block are already local to each iteration and are also out of
-// scope at the pragma location, so they are skipped as well.  Reduction
-// variables use the reduction clause instead.
+// The loop-index variable of the parallelized loop is implicitly private in
+// OpenMP parallel-for and must not be listed when it is declared in the
+// for-init statement, because the pragma is inserted outside the loop's scope.
+// Variables declared inside the loop body or any nested block are already
+// local to each iteration and are also out of scope at the pragma location, so
+// they are skipped as well.  Reduction variables use the reduction clause
+// instead.
+//
+// Nested loop index variables (e.g. the inner 'i' when parallelizing the outer
+// 'j' loop) must be made private explicitly when they are declared at function
+// scope, otherwise concurrent threads share the same induction variable and
+// races occur.
 void fillPrivateVars(SgForStatement* loop, loomX::LoopSummary& summary) {
     SgStatement* loopBody = loop->get_loop_body();
     if (!loopBody) return;
@@ -297,7 +317,8 @@ void fillPrivateVars(SgForStatement* loop, loomX::LoopSummary& summary) {
     SgInitializedName* loopVar = SageInterface::getLoopIndexVariable(loop);
     std::set<SgInitializedName*> reductionVars = summary.getReductionVariables();
 
-    // Collect nested loop index variables so we do not privatise them.
+    // Collect nested loop index variables; they may need an explicit private
+    // clause if they are declared at function scope.
     std::set<SgInitializedName*> nestedLoopVars;
     Rose_STL_Container<SgNode*> nestedLoops =
         NodeQuery::querySubTree(loopBody, V_SgForStatement);
@@ -317,9 +338,9 @@ void fillPrivateVars(SgForStatement* loop, loomX::LoopSummary& summary) {
         SgInitializedName* var = varRef->get_symbol()->get_declaration();
         if (!var) continue;
 
-        // Skip loop index variables (handled implicitly by OpenMP).
+        // Skip the parallelized loop's own index variable (handled implicitly
+        // by OpenMP).
         if (var == loopVar) continue;
-        if (nestedLoopVars.find(var) != nestedLoopVars.end()) continue;
 
         // Skip reduction variables (handled by reduction clause).
         if (reductionVars.find(var) != reductionVars.end()) continue;
@@ -344,6 +365,29 @@ void fillPrivateVars(SgForStatement* loop, loomX::LoopSummary& summary) {
         if (!isScalarVariable(var)) continue;
 
         summary.privateVars.insert(var);
+    }
+
+    // Add function-scoped nested loop index variables to the private clause.
+    for (SgInitializedName* nestedVar : nestedLoopVars) {
+        if (nestedVar == loopVar) continue;
+        if (reductionVars.find(nestedVar) != reductionVars.end()) continue;
+        if (!isScalarVariable(nestedVar)) continue;
+
+        // If the nested loop variable is declared inside the parallel loop body
+        // it is already local to each thread; no clause needed.
+        SgScopeStatement* varScope = nestedVar->get_scope();
+        bool declaredInsideLoop = false;
+        SgNode* currentScope = varScope;
+        while (currentScope && !isSgFunctionDefinition(currentScope)) {
+            if (currentScope == loopBody) {
+                declaredInsideLoop = true;
+                break;
+            }
+            currentScope = currentScope->get_parent();
+        }
+        if (declaredInsideLoop) continue;
+
+        summary.privateVars.insert(nestedVar);
     }
 }
 
@@ -649,6 +693,17 @@ int main(int argc, char* argv[]) {
     for (SgForStatement* loop : collector.loops) {
         std::cout << "\nProcessing loop at line "
                   << loop->get_file_info()->get_line() << "\n";
+
+        // Skip initialization / output helpers in benchmark suites; their
+        // correctness matters for end-to-end validation and they frequently
+        // contain reduction patterns (e.g. PolyBench init_array) that are not
+        // the target of kernel parallelization.
+        std::string funcName = getEnclosingFunctionName(loop);
+        if (funcName == "init_array" || funcName == "print_array") {
+            std::cout << "  -> Skipped: loop inside " << funcName << "\n";
+            skipped++;
+            continue;
+        }
 
         // Skip loops nested inside already-parallelized loops
         bool nested = false;
