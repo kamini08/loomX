@@ -1,5 +1,6 @@
 #include "OpenMPCodeGen.h"
 #include "LoopAnalysisUtil.h"
+#include <map>
 #include <set>
 #include <sstream>
 
@@ -294,13 +295,19 @@ static size_t findPragmaEnd(const std::string& source, size_t pragmaStart) {
     }
 }
 
-// Find the ')' that matches the '(' at `open`, counting nested parentheses so
-// array sections like "A[0:(1024) * (1024)]" are handled as a single unit.
-static size_t findMatchingParen(const std::string& s, size_t open) {
+// Find the index of the closing parenthesis that matches the opening
+// parenthesis at openPos. Returns std::string::npos if no matching close is
+// found. This correctly skips nested parentheses, which matters for OpenMP
+// map clauses like map(tofrom:A[0:(N) * (N)]).
+static size_t findMatchingCloseParen(const std::string& source, size_t openPos) {
+    if (openPos >= source.size() || source[openPos] != '(') {
+        return std::string::npos;
+    }
     int depth = 0;
-    for (size_t i = open; i < s.size(); ++i) {
-        if (s[i] == '(') ++depth;
-        else if (s[i] == ')') {
+    for (size_t i = openPos; i < source.size(); ++i) {
+        if (source[i] == '(') {
+            ++depth;
+        } else if (source[i] == ')') {
             --depth;
             if (depth == 0) return i;
         }
@@ -387,13 +394,30 @@ void OpenMPCodeGen::hoistTargetDataRegions(std::string& source) {
             continue;
         }
 
-        // Collect mapped variables from all pragmas in the run.
-        std::set<std::string> mappedVars;
+        // Collect mapped variables and their directions from all pragmas in
+        // the run. Directions are merged conservatively.
+        std::map<std::string, std::string> mappedVars;
         for (const auto& p : pairs) {
             size_t pragmaEnd = findPragmaEnd(source, p.first);
             std::string pragmaText = source.substr(p.first, pragmaEnd - p.first);
-            std::set<std::string> vars = collectMappedVars(pragmaText);
-            mappedVars.insert(vars.begin(), vars.end());
+            std::map<std::string, std::string> vars = collectMappedVars(pragmaText);
+            for (const auto& kv : vars) {
+                const std::string& name = kv.first;
+                const std::string& direction = kv.second;
+                auto it = mappedVars.find(name);
+                if (it == mappedVars.end()) {
+                    mappedVars[name] = direction;
+                } else {
+                    auto rank = [](const std::string& d) {
+                        if (d == "tofrom") return 2;
+                        if (d == "from") return 1;
+                        return 0;
+                    };
+                    if (rank(direction) > rank(it->second)) {
+                        it->second = direction;
+                    }
+                }
+            }
         }
 
         // If no variables are mapped, hoisting a target data region is pointless
@@ -426,26 +450,81 @@ void OpenMPCodeGen::hoistTargetDataRegions(std::string& source) {
     source = result;
 }
 
-std::set<std::string> OpenMPCodeGen::collectMappedVars(const std::string& pragmaText) {
-    std::set<std::string> vars;
+// Split a comma-separated list respecting nested parentheses and square
+// brackets. Used to parse OpenMP variable lists inside map clauses.
+static std::vector<std::string> splitTopLevelCommas(const std::string& text) {
+    std::vector<std::string> parts;
+    std::string current;
+    int parenDepth = 0;
+    int bracketDepth = 0;
+    for (char c : text) {
+        if (c == '(') {
+            ++parenDepth;
+            current += c;
+        } else if (c == ')') {
+            --parenDepth;
+            current += c;
+        } else if (c == '[') {
+            ++bracketDepth;
+            current += c;
+        } else if (c == ']') {
+            --bracketDepth;
+            current += c;
+        } else if (c == ',' && parenDepth == 0 && bracketDepth == 0) {
+            parts.push_back(current);
+            current.clear();
+        } else {
+            current += c;
+        }
+    }
+    if (!current.empty() || !parts.empty()) {
+        parts.push_back(current);
+    }
+    return parts;
+}
+
+std::map<std::string, std::string> OpenMPCodeGen::collectMappedVars(
+    const std::string& pragmaText) {
+    std::map<std::string, std::string> vars;
     size_t pos = 0;
     while ((pos = pragmaText.find("map(", pos)) != std::string::npos) {
         size_t open = pragmaText.find('(', pos);
         if (open == std::string::npos) break;
-        size_t close = findMatchingParen(pragmaText, open);
+        size_t close = findMatchingCloseParen(pragmaText, open);
         if (close == std::string::npos) break;
 
         std::string inside = pragmaText.substr(open + 1, close - open - 1);
         size_t colon = inside.find(':');
         if (colon != std::string::npos) {
+            std::string direction = inside.substr(0, colon);
+            // Strip whitespace from the direction.
+            size_t db = direction.find_first_not_of(" \t");
+            size_t de = direction.find_last_not_of(" \t");
+            if (db != std::string::npos && de != std::string::npos) {
+                direction = direction.substr(db, de - db + 1);
+            } else {
+                direction = "tofrom";
+            }
             std::string varList = inside.substr(colon + 1);
-            std::istringstream iss(varList);
-            std::string var;
-            while (std::getline(iss, var, ',')) {
+            for (std::string var : splitTopLevelCommas(varList)) {
                 size_t b = var.find_first_not_of(" \t");
                 size_t e = var.find_last_not_of(" \t");
                 if (b != std::string::npos && e != std::string::npos) {
-                    vars.insert(var.substr(b, e - b + 1));
+                    std::string name = var.substr(b, e - b + 1);
+                    // Merge directions conservatively: tofrom > from > to.
+                    auto it = vars.find(name);
+                    if (it == vars.end()) {
+                        vars[name] = direction;
+                    } else {
+                        auto rank = [](const std::string& d) {
+                            if (d == "tofrom") return 2;
+                            if (d == "from") return 1;
+                            return 0;
+                        };
+                        if (rank(direction) > rank(it->second)) {
+                            it->second = direction;
+                        }
+                    }
                 }
             }
         }
@@ -455,17 +534,29 @@ std::set<std::string> OpenMPCodeGen::collectMappedVars(const std::string& pragma
 }
 
 std::string OpenMPCodeGen::buildTargetDataMapClause(
-    const std::set<std::string>& mappedVars) {
+    const std::map<std::string, std::string>& mappedVars) {
     if (mappedVars.empty()) return "";
-    std::ostringstream oss;
-    oss << "map(tofrom:";
-    bool first = true;
-    for (const std::string& var : mappedVars) {
-        if (!first) oss << ", ";
-        first = false;
-        oss << var;
+
+    // Group variables by direction.
+    std::map<std::string, std::vector<std::string>> directionGroups;
+    for (const auto& [name, direction] : mappedVars) {
+        directionGroups[direction].push_back(name);
     }
-    oss << ")";
+
+    std::ostringstream oss;
+    bool firstClause = true;
+    for (const auto& [direction, vars] : directionGroups) {
+        if (!firstClause) oss << " ";
+        firstClause = false;
+        oss << "map(" << direction << ":";
+        bool firstVar = true;
+        for (const std::string& varName : vars) {
+            if (!firstVar) oss << ", ";
+            firstVar = false;
+            oss << varName;
+        }
+        oss << ")";
+    }
     return oss.str();
 }
 
@@ -477,9 +568,8 @@ std::string OpenMPCodeGen::stripTargetAndMap(const std::string& pragmaText) {
     // Only remove the per-loop map clauses.
     size_t pos = 0;
     while ((pos = result.find(" map(", pos)) != std::string::npos) {
-        size_t open = result.find('(', pos);
-        if (open == std::string::npos) break;
-        size_t close = findMatchingParen(result, open);
+        size_t open = pos + std::string(" map(").size() - 1;
+        size_t close = findMatchingCloseParen(result, open);
         if (close == std::string::npos) break;
         result.erase(pos, close - pos + 1);
     }

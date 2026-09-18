@@ -34,9 +34,12 @@ private:
     std::string buildReductionClause(
         const std::vector<loomX::ReductionInfo>& reductionDetails);
 
-    // Target-data hoisting helpers (text-based).
-    static std::set<std::string> collectMappedVars(const std::string& regionText);
+    // Target-data hoisting helpers (text-based). collectMappedVars returns a
+    // map from variable name to its OpenMP map direction (to/from/tofrom) as
+    // extracted from the pragma text.
+    static std::map<std::string, std::string> collectMappedVars(
+        const std::string& regionText);
     static std::string stripTargetAndMap(const std::string& pragmaText);
     static std::string buildTargetDataMapClause(
-        const std::set<std::string>& mappedVars);
+        const std::map<std::string, std::string>& mappedVars);
 };
