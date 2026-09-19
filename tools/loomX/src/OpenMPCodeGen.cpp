@@ -42,33 +42,6 @@ void OpenMPCodeGen::insertCPUPragma(const loomX::LoopSummary& summary) {
     SageInterface::insertStatementBefore(loop, pragmaDecl);
 }
 
-// Return how many perfectly nested for-loops we can collapse starting at
-// `loop`.  A body is considered perfectly nested if it consists of a single
-// SgForStatement and nothing else (ROSE emits one statement per body in the
-// canonical case).
-static int computeCollapseDepth(SgForStatement* loop) {
-    if (!loop) return 0;
-    SgStatement* body = loop->get_loop_body();
-    if (!body) return 1;
-
-    // If the body is a single for-statement, collapse it.
-    SgForStatement* inner = isSgForStatement(body);
-    if (inner) {
-        return 1 + computeCollapseDepth(inner);
-    }
-
-    // ROSE sometimes wraps the inner for in a basic block.
-    SgBasicBlock* bb = isSgBasicBlock(body);
-    if (bb) {
-        const auto& stmts = bb->get_statements();
-        if (stmts.size() == 1 && isSgForStatement(stmts[0])) {
-            return 1 + computeCollapseDepth(isSgForStatement(stmts[0]));
-        }
-    }
-
-    return 1;
-}
-
 void OpenMPCodeGen::insertGPUPragma(const loomX::LoopSummary& summary) {
     SgForStatement* loop = summary.loop;
     if (!loop) return;
@@ -82,7 +55,6 @@ void OpenMPCodeGen::insertGPUPragma(const loomX::LoopSummary& summary) {
     // no loop-carried dependence.
     if (summary.collapseDepth > 1) {
         pragmaText << " collapse(" << summary.collapseDepth << ")";
-    }
     }
 
     if (!summary.privateVars.empty()) {
