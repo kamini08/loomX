@@ -65,6 +65,23 @@ std::set<SgInitializedName*> collectNestedLoopIndexVariables(SgForStatement* loo
     return vars;
 }
 
+// Collect the index variables of the current loop and all enclosing for-loops.
+// These are known induction variables of the loop nest and can be treated as
+// symbolic constants for dependence analysis of the current loop.
+std::set<SgInitializedName*> collectEnclosingLoopIndexVariables(SgForStatement* loop) {
+    std::set<SgInitializedName*> vars;
+    SgNode* current = loop;
+    while (current) {
+        if (SgForStatement* fs = isSgForStatement(current)) {
+            if (SgInitializedName* iv = SageInterface::getLoopIndexVariable(fs)) {
+                vars.insert(iv);
+            }
+        }
+        current = current->get_parent();
+    }
+    return vars;
+}
+
 // True if expr references var.
 bool subscriptContainsVar(SgExpression* expr, SgInitializedName* var) {
     if (!expr || !var) return false;
@@ -107,30 +124,39 @@ DependenceResult LoopDependenceAnalysis::analyze(SgForStatement* loop) {
         return result;
     }
 
+    knownLoopVars_ = collectEnclosingLoopIndexVariables(loop);
+    knownLoopVars_.insert(loopVar);
+    std::set<SgInitializedName*> nestedVars = collectNestedLoopIndexVariables(loop);
+    knownLoopVars_.insert(nestedVars.begin(), nestedVars.end());
+
     std::vector<ArrayReference> refs = collectArrayReferences(loop);
 
-    // Conservative guard: if a write reference inside this loop is indexed by
-    // a nested loop variable and the current loop variable does not appear in
-    // any of its subscripts, different iterations of the current loop may touch
-    // the same element.  Treat that as a loop-carried dependence so we don't
-    // parallelize outer loops that contain reductions over inner-loop indices
-    // (e.g. PolyBench atax/bicg).
+    // Conservative guard for outer loops: if a write reference inside this
+    // loop is indexed by a nested loop variable and the current loop variable
+    // does not appear in any of its subscripts, different iterations of the
+    // current loop may touch the same element.  Treat that as a loop-carried
+    // dependence so we don't parallelize outer loops that contain reductions
+    // over inner-loop indices (e.g. PolyBench atax/bicg).  We only apply this
+    // to loops that actually contain nested loops, so that innermost reduction
+    // loops (e.g. gemm's k-loop) are still handled by the reduction detector.
     std::set<SgInitializedName*> nestedLoopVars = collectNestedLoopIndexVariables(loop);
-    for (const ArrayReference& ref : refs) {
-        if (!ref.isWrite) continue;
-        if (!ref.baseVariable) continue;
-        bool currentLoopVarInAnySubscript = false;
-        bool nestedLoopVarInAnySubscript = false;
-        for (SgExpression* sub : ref.subscripts) {
-            if (subscriptContainsVar(sub, loopVar)) currentLoopVarInAnySubscript = true;
-            if (subscriptContainsAnyNestedLoopVar(sub, nestedLoopVars)) nestedLoopVarInAnySubscript = true;
-        }
-        if (!currentLoopVarInAnySubscript && nestedLoopVarInAnySubscript) {
-            result.hasLoopCarriedDependence = true;
-            result.description = "write indexed by nested loop variable on " +
-                                 ref.baseVariable->get_name().getString();
-            result.source = ref.subscripts.empty() ? nullptr : ref.subscripts.front();
-            return result;
+    if (!nestedLoopVars.empty()) {
+        for (const ArrayReference& ref : refs) {
+            if (!ref.isWrite) continue;
+            if (!ref.baseVariable) continue;
+            bool currentLoopVarInAnySubscript = false;
+            bool nestedLoopVarInAnySubscript = false;
+            for (SgExpression* sub : ref.subscripts) {
+                if (subscriptContainsVar(sub, loopVar)) currentLoopVarInAnySubscript = true;
+                if (subscriptContainsAnyNestedLoopVar(sub, nestedLoopVars)) nestedLoopVarInAnySubscript = true;
+            }
+            if (!currentLoopVarInAnySubscript && nestedLoopVarInAnySubscript) {
+                result.hasLoopCarriedDependence = true;
+                result.description = "write indexed by nested loop variable on " +
+                                     ref.baseVariable->get_name().getString();
+                result.source = ref.subscripts.empty() ? nullptr : ref.subscripts.front();
+                return result;
+            }
         }
     }
 
@@ -233,17 +259,24 @@ AffineSubscript LoopDependenceAnalysis::extractAffineSubscript(
 
     // Case: loop variable itself.
     if (SgVarRefExp* varRef = isSgVarRefExp(expr)) {
-        if (varRef->get_symbol()->get_declaration() == loopVar) {
+        SgInitializedName* var = varRef->get_symbol()->get_declaration();
+        if (var == loopVar) {
             result.isAffine = true;
             result.coefficient = 1;
             result.constant = 0;
             return result;
         }
-        // A variable other than the loop index is not a compile-time
-        // constant. Treating it as coefficient-zero can incorrectly prove
-        // indirect accesses such as a[indexSet[i]] independent. Unknown
-        // subscripts must remain conservative until range/alias analysis can
-        // prove disjointness.
+        // Other induction variables of the loop nest (enclosing or nested
+        // loops) are parameters for this analysis and can be treated as
+        // symbolic constants.  Arbitrary variables (e.g. indexSet[i]) remain
+        // unknown and force a conservative dependence.
+        if (knownLoopVars_.find(var) != knownLoopVars_.end()) {
+            result.isAffine = true;
+            result.coefficient = 0;
+            result.constant = 0;
+            result.note = "symbolic loop-nest induction variable";
+            return result;
+        }
         result.note = "unknown symbolic subscript";
         return result;
     }

@@ -61,6 +61,10 @@ private:
     bool hasLoopCarriedDependence(SgExpression* sub1,
                                   SgExpression* sub2,
                                   SgInitializedName* loopVar);
+
+    // Induction variables of the loop nest being analysed.  These are treated
+    // as symbolic constants in subscript expressions.
+    std::set<SgInitializedName*> knownLoopVars_;
 };
 
 } // namespace loomX

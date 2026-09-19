@@ -161,10 +161,28 @@ static std::string buildMappedVarName(SgInitializedName* var) {
 
 std::string OpenMPCodeGen::buildMapClause(
     const std::set<std::pair<SgInitializedName*, std::string>>& mapClauses) {
+    // Deduplicate by variable name, keeping the most conservative direction
+    // (tofrom > from > to) in case the same name was collected from multiple
+    // variable references (e.g. outer-loop scalars also referenced in inner
+    // loops).
+    std::map<std::string, std::string> directionByName;
+    auto directionRank = [](const std::string& d) {
+        if (d == "tofrom") return 2;
+        if (d == "from") return 1;
+        return 0;
+    };
+    for (const auto& [var, direction] : mapClauses) {
+        std::string name = buildMappedVarName(var);
+        auto it = directionByName.find(name);
+        if (it == directionByName.end() || directionRank(direction) > directionRank(it->second)) {
+            directionByName[name] = direction;
+        }
+    }
+
     // Group variables by direction.
     std::map<std::string, std::vector<std::string>> directionGroups;
-    for (const auto& [var, direction] : mapClauses) {
-        directionGroups[direction].push_back(buildMappedVarName(var));
+    for (const auto& [name, direction] : directionByName) {
+        directionGroups[direction].push_back(name);
     }
 
     std::ostringstream oss;

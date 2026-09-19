@@ -200,6 +200,10 @@ SgNode * ClangToSageTranslator::Traverse(const clang::Type * type) {
             ret_status = VisitTypedefType((clang::TypedefType *)type, &result);
             ROSE_ASSERT(result != NULL);
             break;
+        case clang::Type::Using:
+            ret_status = VisitUsingType((clang::UsingType *)type, &result);
+            ROSE_ASSERT(result != NULL);
+            break;
         case clang::Type::TypeOfExpr:
             ret_status = VisitTypeOfExprType((clang::TypeOfExprType *)type, &result);
             ROSE_ASSERT(result != NULL);
@@ -241,7 +245,7 @@ SgNode * ClangToSageTranslator::Traverse(const clang::Type * type) {
             break;
 
         default:
-            logger[ERROR] << "Unhandled type" << "\n";
+            logger[ERROR] << "Unhandled type: " << type->getTypeClassName() << "\n";
             ROSE_ABORT();
     }
 
@@ -528,18 +532,17 @@ bool ClangToSageTranslator::VisitBuiltinType(clang::BuiltinType * builtin_type, 
         case clang::BuiltinType::UShort:     *node = SageBuilder::buildUnsignedShortType();    break;
         case clang::BuiltinType::ULong:      *node = SageBuilder::buildUnsignedLongType();     break;
         case clang::BuiltinType::ULongLong:  *node = SageBuilder::buildUnsignedLongLongType(); break;
-/*
-        case clang::BuiltinType::NullPtr:    *node = SageBuilder::build(); break;
-*/
+        case clang::BuiltinType::NullPtr:  *node = SageBuilder::buildNullptrType();          break;
         // TODO ROSE type ?
         case clang::BuiltinType::UInt128:    *node = SageBuilder::buildUnsignedLongLongType(); break;
         case clang::BuiltinType::Int128:     *node = SageBuilder::buildLongLongType();         break;
  
-        case clang::BuiltinType::Char_U:    logger[WARN] << "Char_U    -> "; break;
-        case clang::BuiltinType::WChar_U:   logger[WARN] << "WChar_U   -> "; break;
-        case clang::BuiltinType::Char16:    logger[WARN] << "Char16    -> "; break;
-        case clang::BuiltinType::Char32:    logger[WARN] << "Char32    -> "; break;
-        case clang::BuiltinType::WChar_S:   logger[WARN] << "WChar_S   -> "; break;
+        case clang::BuiltinType::Char_U:    *node = SageBuilder::buildUnsignedCharType();   break;
+        case clang::BuiltinType::WChar_U:   *node = SageBuilder::buildWcharType();            break;
+        case clang::BuiltinType::Char16:    *node = SageBuilder::buildChar16Type();           break;
+        case clang::BuiltinType::Char32:    *node = SageBuilder::buildChar32Type();           break;
+        case clang::BuiltinType::WChar_S:   *node = SageBuilder::buildWcharType();            break;
+        case clang::BuiltinType::Char8:     *node = SageBuilder::buildUnsignedCharType();     break;
 
 
         case clang::BuiltinType::ObjCId:
@@ -550,7 +553,7 @@ bool ClangToSageTranslator::VisitBuiltinType(clang::BuiltinType * builtin_type, 
         case clang::BuiltinType::BoundMember:
         case clang::BuiltinType::UnknownAny:
         default:
-            logger[ERROR] << "Unknown builtin type: " << builtin_type->getName(p_compiler_instance->getLangOpts()).str() << " !" << "\n";
+            logger[ERROR] << "Unknown builtin type: " << builtin_type->getName(p_compiler_instance->getLangOpts()).str() << " (kind=" << builtin_type->getKind() << ") !" << "\n";
             exit(-1);
     }
 
@@ -577,7 +580,9 @@ bool ClangToSageTranslator::VisitDecltypeType(clang::DecltypeType * decltype_typ
 #endif
     bool res = true;
 
-    ROSE_ASSERT(FAIL_FIXME == 0); // FIXME 
+    // decltype(T) is just the type of the underlying expression; translate
+    // the already-computed underlying QualType.
+    *node = buildTypeFromQualifiedType(decltype_type->getUnderlyingType());
 
     return VisitType(decltype_type, node) && res;
 }
@@ -971,7 +976,10 @@ bool ClangToSageTranslator::VisitTemplateSpecializationType(clang::TemplateSpeci
 #endif
     bool res = true;
 
-    ROSE_ASSERT(FAIL_FIXME == 0); // FIXME 
+    // Non-dependent template specializations are sugar for a record type
+    // (or a type alias). Translate the desugared canonical type so ROSE
+    // sees a concrete class/typedef.
+    *node = buildTypeFromQualifiedType(template_specialization_type->desugar());
 
     return VisitType(template_specialization_type, node) && res;
 }
@@ -1013,6 +1021,19 @@ bool ClangToSageTranslator::VisitTypedefType(clang::TypedefType * typedef_type, 
     *node = tdef_sym->get_type();
 
    return VisitType(typedef_type, node) && res;
+}
+
+bool ClangToSageTranslator::VisitUsingType(clang::UsingType * using_type, SgNode ** node) {
+#if DEBUG_VISIT_TYPE
+    logger[DEBUG] << "ClangToSageTranslator::VisitUsingType" << "\n";
+#endif
+    bool res = true;
+
+    // A using-declaration for a type aliases another type. Translate the
+    // underlying type so ROSE sees the canonical representation.
+    *node = buildTypeFromQualifiedType(using_type->getUnderlyingType());
+
+    return VisitType(using_type, node) && res;
 }
 
 bool ClangToSageTranslator::VisitTypeOfExprType(clang::TypeOfExprType * type_of_expr_type, SgNode ** node) {
