@@ -89,6 +89,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         src/GpuProfitability.cpp
         src/OpenMPCodeGen.cpp
         src/OpenACCCodeGen.cpp
+        src/CudaCodeGen.cpp
         src/LoopCanonicalChecker.cpp
         src/IterationCountEstimator.cpp
         src/DivergenceAnalyzer.cpp
@@ -116,6 +117,7 @@ else()
         src/GpuProfitability.cpp
         src/OpenMPCodeGen.cpp
         src/OpenACCCodeGen.cpp
+        src/CudaCodeGen.cpp
         src/LoopCanonicalChecker.cpp
         src/IterationCountEstimator.cpp
         src/DivergenceAnalyzer.cpp

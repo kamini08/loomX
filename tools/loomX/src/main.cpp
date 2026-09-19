@@ -4,6 +4,7 @@
 #include "GpuProfitability.h"
 #include "OpenMPCodeGen.h"
 #include "OpenACCCodeGen.h"
+#include "CudaCodeGen.h"
 #include "LoopSummary.h"
 #include "LoopDependenceAnalysis.h"
 #include "PragmaAnalysis.h"
@@ -657,7 +658,7 @@ int main(int argc, char* argv[]) {
                   << " [-v|--verbose] [--intraprocedural-baseline] [--no-scalar-dep-check]"
                   << " [--strict-race-safety]"
                   << " [--cpu-only|--gpu-naive|--gpu-profitable|--analyze-only]"
-                  << " [--target-backend <openmp|openacc>]"
+                  << " [--target-backend <openmp|openacc|cuda>]"
                   << " [--no-phase-couple]"
                   << " [--min-gpu-speedup <f>] [--min-nested-flop <n>]"
                   << " [--min-total-flop <n>] [--min-cpu-openmp-flop <n>]"
@@ -716,6 +717,8 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<CodeGen> codegen;
     if (targetBackend == "openacc") {
         codegen = std::make_unique<OpenACCCodeGen>();
+    } else if (targetBackend == "cuda") {
+        codegen = std::make_unique<CudaCodeGen>();
     } else {
         codegen = std::make_unique<OpenMPCodeGen>();
     }
