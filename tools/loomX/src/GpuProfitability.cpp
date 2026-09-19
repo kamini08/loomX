@@ -406,8 +406,16 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
         return ParallelTarget::SEQUENTIAL;
     }
 
+    // Helper: does the loop carry enough work to amortise CPU OpenMP
+    // threading / reduction overhead?  Without this gate, tiny init, reduction,
+    // or fallback loops are classified as CPU_OPENMP and run slower than the
+    // sequential baseline because of parallel overhead.
+    auto cpuOpenmpWorthwhile = [&]() {
+        return totalWork >= config_.minTotalFlopForCPUOpenMP;
+    };
+
     if (!regular || stronglyDivergent) {
-        if (iterations >= config_.minIterationsForCPU) {
+        if (iterations >= config_.minIterationsForCPU && cpuOpenmpWorthwhile()) {
             return ParallelTarget::CPU_OPENMP;
         }
         return ParallelTarget::SEQUENTIAL;
@@ -418,7 +426,7 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
     // them to CPU OpenMP (if large enough) or sequential, regardless of the
     // raw cost-model speedup.
     if (initLoop || reductionOnly) {
-        if (iterations >= config_.minIterationsForParallel) {
+        if (iterations >= config_.minIterationsForParallel && cpuOpenmpWorthwhile()) {
             return ParallelTarget::CPU_OPENMP;
         }
         return ParallelTarget::SEQUENTIAL;
@@ -442,7 +450,7 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
         return ParallelTarget::GPU_OFFLOAD;
     }
 
-    if (iterations >= config_.minIterationsForParallel) {
+    if (iterations >= config_.minIterationsForParallel && cpuOpenmpWorthwhile()) {
         return ParallelTarget::CPU_OPENMP;
     }
 

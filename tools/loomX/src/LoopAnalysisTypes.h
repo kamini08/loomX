@@ -30,6 +30,10 @@ struct ProfitabilityConfig {
     // checksum) from going to the GPU.
     long long minTotalFlopForGPU = 10000000;
 
+    // Minimum total FLOPs for CPU OpenMP fallback.  Small loops rarely amortise
+    // thread-launch and reduction overhead, so keep them sequential.
+    long long minTotalFlopForCPUOpenMP = 10000000;
+
     // FLOPs per memory-op threshold used by the compute-intensity estimator.
     double computeBoundThreshold = 16.0;
 

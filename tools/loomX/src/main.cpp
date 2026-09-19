@@ -611,6 +611,8 @@ int main(int argc, char* argv[]) {
             config.minNestedFlopForGPU = std::stoll(argv[++i]);
         } else if (arg == "--min-total-flop" && i + 1 < argc) {
             config.minTotalFlopForGPU = std::stoll(argv[++i]);
+        } else if (arg == "--min-cpu-openmp-flop" && i + 1 < argc) {
+            config.minTotalFlopForCPUOpenMP = std::stoll(argv[++i]);
         } else if (arg == "--compute-bound-threshold" && i + 1 < argc) {
             config.computeBoundThreshold = std::stod(argv[++i]);
         } else if (arg == "--gpu-compute-efficiency" && i + 1 < argc) {
@@ -651,7 +653,8 @@ int main(int argc, char* argv[]) {
                   << " [--cpu-only|--gpu-naive|--gpu-profitable|--analyze-only]"
                   << " [--no-phase-couple]"
                   << " [--min-gpu-speedup <f>] [--min-nested-flop <n>]"
-                  << " [--min-total-flop <n>] [--compute-bound-threshold <f>]"
+                  << " [--min-total-flop <n>] [--min-cpu-openmp-flop <n>]"
+                  << " [--compute-bound-threshold <f>]"
                   << " [--pcie-factor <f>] [--gpu-compute-throughput <f>]"
                   << " [--gpu-mem-bandwidth <f>] [--pcie-bandwidth <f>]"
                   << " [--cpu-core-count <n>] [--cpu-mem-bandwidth <f>]"
