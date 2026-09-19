@@ -90,6 +90,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         src/OpenMPCodeGen.cpp
         src/OpenACCCodeGen.cpp
         src/CudaCodeGen.cpp
+        src/OpenCLCodeGen.cpp
         src/LoopCanonicalChecker.cpp
         src/IterationCountEstimator.cpp
         src/DivergenceAnalyzer.cpp
@@ -118,6 +119,7 @@ else()
         src/OpenMPCodeGen.cpp
         src/OpenACCCodeGen.cpp
         src/CudaCodeGen.cpp
+        src/OpenCLCodeGen.cpp
         src/LoopCanonicalChecker.cpp
         src/IterationCountEstimator.cpp
         src/DivergenceAnalyzer.cpp

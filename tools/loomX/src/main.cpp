@@ -5,6 +5,7 @@
 #include "OpenMPCodeGen.h"
 #include "OpenACCCodeGen.h"
 #include "CudaCodeGen.h"
+#include "OpenCLCodeGen.h"
 #include "LoopSummary.h"
 #include "LoopDependenceAnalysis.h"
 #include "PragmaAnalysis.h"
@@ -658,7 +659,7 @@ int main(int argc, char* argv[]) {
                   << " [-v|--verbose] [--intraprocedural-baseline] [--no-scalar-dep-check]"
                   << " [--strict-race-safety]"
                   << " [--cpu-only|--gpu-naive|--gpu-profitable|--analyze-only]"
-                  << " [--target-backend <openmp|openacc|cuda>]"
+                  << " [--target-backend <openmp|openacc|cuda|opencl>]"
                   << " [--no-phase-couple]"
                   << " [--min-gpu-speedup <f>] [--min-nested-flop <n>]"
                   << " [--min-total-flop <n>] [--min-cpu-openmp-flop <n>]"
@@ -719,6 +720,8 @@ int main(int argc, char* argv[]) {
         codegen = std::make_unique<OpenACCCodeGen>();
     } else if (targetBackend == "cuda") {
         codegen = std::make_unique<CudaCodeGen>();
+    } else if (targetBackend == "opencl") {
+        codegen = std::make_unique<OpenCLCodeGen>();
     } else {
         codegen = std::make_unique<OpenMPCodeGen>();
     }
