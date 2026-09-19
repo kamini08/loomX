@@ -73,3 +73,9 @@ GTAGS
 # Internal build directories
 /_build
 /_build_*
+
+# Local builds / staged installs
+/install/
+/rose-build/
+/stamp-h.in
+/stamp-h1.in
