@@ -295,19 +295,20 @@ static size_t findPragmaEnd(const std::string& source, size_t pragmaStart) {
     }
 }
 
-// Find the index of the closing parenthesis that matches the opening
-// parenthesis at openPos. Returns std::string::npos if no matching close is
-// found. This correctly skips nested parentheses, which matters for OpenMP
-// map clauses like map(tofrom:A[0:(N) * (N)]).
-static size_t findMatchingCloseParen(const std::string& source, size_t openPos) {
-    if (openPos >= source.size() || source[openPos] != '(') {
+// Find the index of the closing delimiter that matches the opening delimiter
+// at openPos. Returns std::string::npos if no matching close is found. This
+// correctly skips nested delimiters, which matters for OpenMP map clauses like
+// map(tofrom:A[0:(N) * (N)]) and for braced loop bodies.
+static size_t findMatchingClose(const std::string& source, size_t openPos,
+                                char openChar, char closeChar) {
+    if (openPos >= source.size() || source[openPos] != openChar) {
         return std::string::npos;
     }
     int depth = 0;
     for (size_t i = openPos; i < source.size(); ++i) {
-        if (source[i] == '(') {
+        if (source[i] == openChar) {
             ++depth;
-        } else if (source[i] == ')') {
+        } else if (source[i] == closeChar) {
             --depth;
             if (depth == 0) return i;
         }
@@ -315,17 +316,56 @@ static size_t findMatchingCloseParen(const std::string& source, size_t openPos) 
     return std::string::npos;
 }
 
-// Find the end of the for-statement that starts at forStart (skip its body).
-static size_t findForStatementEnd(const std::string& source, size_t forStart) {
-    size_t pos = source.find('{', forStart);
-    if (pos == std::string::npos) return source.size();
+static size_t findMatchingCloseParen(const std::string& source, size_t openPos) {
+    return findMatchingClose(source, openPos, '(', ')');
+}
 
-    int depth = 0;
-    for (size_t i = pos; i < source.size(); ++i) {
-        if (source[i] == '{') ++depth;
-        else if (source[i] == '}') {
-            --depth;
-            if (depth == 0) return i + 1;
+static size_t findMatchingCloseBrace(const std::string& source, size_t openPos) {
+    return findMatchingClose(source, openPos, '{', '}');
+}
+
+// Find the end of the for-statement that starts at forStart. Handles both
+// braced bodies (for (...) { ... }) and single-statement bodies
+// (for (...) stmt;). Returns source.size() if the structure cannot be parsed.
+static size_t findForStatementEnd(const std::string& source, size_t forStart) {
+    // Find the '(' that begins the for-header.
+    size_t headerOpen = source.find('(', forStart);
+    if (headerOpen == std::string::npos) return source.size();
+
+    // Find the matching ')' that ends the for-header.
+    size_t headerClose = findMatchingCloseParen(source, headerOpen);
+    if (headerClose == std::string::npos) return source.size();
+
+    // Skip whitespace after the header to find the body.
+    size_t bodyStart = source.find_first_not_of(" \t\n", headerClose + 1);
+    if (bodyStart == std::string::npos) return source.size();
+
+    // Braced body: find matching '}'.
+    if (source[bodyStart] == '{') {
+        size_t bodyClose = findMatchingCloseBrace(source, bodyStart);
+        if (bodyClose == std::string::npos) return source.size();
+        return bodyClose + 1;
+    }
+
+    // Single-statement body: find the terminating ';' that is not inside
+    // nested braces or parentheses. We must skip semicolons inside nested
+    // for/if/while headers (e.g. for(j=0; j<n; j++) ...).
+    int braceDepth = 0;
+    int parenDepth = 0;
+    for (size_t i = bodyStart; i < source.size(); ++i) {
+        char c = source[i];
+        if (c == '{') {
+            ++braceDepth;
+        } else if (c == '}') {
+            --braceDepth;
+            if (braceDepth < 0) braceDepth = 0;
+        } else if (c == '(') {
+            ++parenDepth;
+        } else if (c == ')') {
+            --parenDepth;
+            if (parenDepth < 0) parenDepth = 0;
+        } else if (c == ';' && braceDepth == 0 && parenDepth == 0) {
+            return i + 1;
         }
     }
     return source.size();
