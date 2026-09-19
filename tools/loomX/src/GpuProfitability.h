@@ -80,4 +80,9 @@ private:
 
     // True if the loop body contains any nested for-loop.
     bool hasNestedLoops(SgForStatement* loop);
+
+    // True if this for-loop is not nested inside another for-loop in the AST.
+    // CPU OpenMP is generally a poor choice for inner loops of a sequential nest
+    // because of repeated parallel-region creation overhead.
+    bool isOutermostLoop(SgForStatement* loop);
 };

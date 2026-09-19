@@ -414,9 +414,18 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
         return totalWork >= config_.minTotalFlopForCPUOpenMP;
     };
 
+    // CPU OpenMP is most effective on outermost loops.  Parallelising an inner
+    // loop that is repeatedly invoked by an outer sequential loop creates a
+    // new parallel region every iteration of the outer loop, which is usually
+    // slower than just running the whole nest sequentially.
+    auto cpuTarget = [&]() {
+        return isOutermostLoop(loop) ? ParallelTarget::CPU_OPENMP
+                                     : ParallelTarget::SEQUENTIAL;
+    };
+
     if (!regular || stronglyDivergent) {
         if (iterations >= config_.minIterationsForCPU && cpuOpenmpWorthwhile()) {
-            return ParallelTarget::CPU_OPENMP;
+            return cpuTarget();
         }
         return ParallelTarget::SEQUENTIAL;
     }
@@ -427,7 +436,7 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
     // raw cost-model speedup.
     if (initLoop || reductionOnly) {
         if (iterations >= config_.minIterationsForParallel && cpuOpenmpWorthwhile()) {
-            return ParallelTarget::CPU_OPENMP;
+            return cpuTarget();
         }
         return ParallelTarget::SEQUENTIAL;
     }
@@ -451,7 +460,7 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
     }
 
     if (iterations >= config_.minIterationsForParallel && cpuOpenmpWorthwhile()) {
-        return ParallelTarget::CPU_OPENMP;
+        return cpuTarget();
     }
 
     return ParallelTarget::SEQUENTIAL;
@@ -595,4 +604,14 @@ bool GpuProfitability::hasNestedLoops(SgForStatement* loop) {
     Rose_STL_Container<SgNode*> nested =
         NodeQuery::querySubTree(body, V_SgForStatement);
     return !nested.empty();
+}
+
+bool GpuProfitability::isOutermostLoop(SgForStatement* loop) {
+    if (!loop) return false;
+    SgNode* parent = loop->get_parent();
+    while (parent) {
+        if (isSgForStatement(parent)) return false;
+        parent = parent->get_parent();
+    }
+    return true;
 }
