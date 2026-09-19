@@ -33,19 +33,26 @@ struct ProfitabilityConfig {
     // FLOPs per memory-op threshold used by the compute-intensity estimator.
     double computeBoundThreshold = 16.0;
 
-    // Abstract hardware throughput numbers (relative units). These are not
-    // meant to model a specific GPU exactly; they give the cost model a
-    // consistent shape so decisions improve as the loop gets larger or more
-    // compute-intensive.
-    // Defaults are tuned so that large compute-bound kernels (e.g. PolyBench
-    // gemm) favour GPU offload while small or memory-bound loops stay on CPU.
-    double cpuComputeThroughput = 5.0;     // GFLOP/s (scalar, single-thread)
-    double gpuComputeThroughput = 5000.0;  // GFLOP/s
-    double cpuMemoryBandwidth = 20.0;      // GB/s
-    double gpuMemoryBandwidth = 500.0;     // GB/s
-    double pcieBandwidth = 32.0;           // GB/s
+    // Hardware throughput numbers estimated for the actual target GPU: an
+    // NVIDIA GeForce RTX 4050 Laptop (compute capability 8.9, 6 GB GDDR6).
+    //   - FP32 peak      ~12 TFLOPS (2560 CUDA cores @ ~2.37 GHz)
+    //   - device memory  ~192 GB/s (96-bit GDDR6 @ 16 Gbps)
+    //   - PCIe Gen4 x8 max, negotiated x4 on this laptop (~8 GB/s/direction)
+    //   - libomptarget offload launch overhead ~10 us, PCIe latency ~5 us
+    // `gpuComputeThroughput` is the raw peak; the model multiplies it by
+    // `gpuComputeEfficiency` to approximate real kernel throughput.
+    double cpuComputeThroughput = 5.0;     // GFLOP/s per core (scalar, single-thread)
+    double gpuComputeThroughput = 12000.0; // GFLOP/s (FP32 peak)
+    double cpuMemoryBandwidth = 20.0;      // GB/s (per socket, shared)
+    double gpuMemoryBandwidth = 192.0;     // GB/s (RTX 4050 Laptop)
+    double pcieBandwidth = 8.0;            // GB/s (PCIe Gen4 x4 negotiated)
     double pcieLatency = 5.0;              // microseconds per transfer direction
     double kernelLaunchOverhead = 10.0;    // microseconds
+
+    // Number of CPU cores the CPU OpenMP config actually uses.  The GPU
+    // profitability decision must compare against the parallel CPU, not a
+    // single thread: the harness always runs CPU configs with OpenMP.
+    int cpuCoreCount = 8;
 
     // GPU must be at least this many times faster than CPU to justify offload.
     double minGpuSpeedup = 1.2;
@@ -70,9 +77,11 @@ struct ProfitabilityConfig {
     double heavyMathCostFactor = 8.0;
 
     // Fraction of total memory traffic that crosses PCIe.  With target-data
-    // hoisting this can be much less than 1.0 because data is resident on the
-    // device across multiple kernels.
-    double pcieTransferFactor = 1.0;
+    // hoisting the data is moved to the device once per region and stays
+    // resident, so only a fraction of the traffic actually crosses the bus.
+    // Empirically 0.1-0.2 fits kernels with good data reuse; 1.0 (no reuse)
+    // over-penalizes offload and pushes small-but-GPU-friendly loops to CPU.
+    double pcieTransferFactor = 0.15;
 
     // CPU cache reuse factor for unit-stride/sequential accesses.  The naive
     // memory-time estimate assumes every access misses in cache; this factor

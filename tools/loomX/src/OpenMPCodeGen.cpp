@@ -48,6 +48,14 @@ void OpenMPCodeGen::insertGPUPragma(const loomX::LoopSummary& summary) {
     std::ostringstream pragmaText;
     pragmaText << "omp target teams distribute parallel for";
 
+    // Flatten a perfectly nested 2D/3D fan for better GPU occupancy.  The
+    // collapse depth is precomputed by GpuProfitability::collapseDepthFor and
+    // only ever >= 2 when every collapsed inner loop is canonical and carries
+    // no loop-carried dependence.
+    if (summary.collapseDepth > 1) {
+        pragmaText << " collapse(" << summary.collapseDepth << ")";
+    }
+
     if (!summary.privateVars.empty()) {
         pragmaText << " private(" << buildVarList(summary.privateVars) << ")";
     }
@@ -121,11 +129,21 @@ void OpenMPCodeGen::insertDeclareTargetPragmas(const loomX::LoopSummary& summary
     }
 }
 
-// Build a mapped variable reference. For arrays with known constant sizes,
-// emit a flat array section covering the whole allocation (e.g. "A[0:1024]").
-// Multi-dimensional arrays are flattened to a single element count. Pointers
-// or arrays whose size cannot be determined fall back to the bare variable
-// name.
+// Build a mapped variable reference.
+//
+// - File-scope / static / local arrays: the bare variable name is enough;
+//   the runtime sizes the transfer from the compile-time extent.
+// - Function-parameter arrays: a parameter of type "double A[N][N]" is
+//   really a pointer at the ABI level, so map(A) would transfer only the
+//   pointer (8 bytes) and the device kernel would fault.  These need an
+//   explicit array section.
+//
+// Multi-dimensional arrays must use a per-dimension section
+// "A[0:N][0:M]": clang-15 interprets the length of "A[0:K]" as the number of
+// ROWS, not the flat element count, so a flat section "A[0:(N)*(M)]"
+// allocates N*M*M bytes (cuMemAlloc OOM), and flat sections on static arrays
+// are mis-sized past their object (libomptarget abort "explicit extension not
+// allowed").  Per-dimension sections have an exact size in both cases.
 static std::string buildMappedVarName(SgInitializedName* var) {
     if (!var) return "";
 
@@ -137,26 +155,25 @@ static std::string buildMappedVarName(SgInitializedName* var) {
     SgArrayType* arrType = isSgArrayType(type);
     if (!arrType) return name;
 
-    // Multiply all dimensions to get the total element count.
-    std::string sizeStr;
+    bool isParameter = isSgFunctionParameterList(var->get_parent()) != nullptr;
+    if (!isParameter) return name;
+
+    // Emit one [0:<dim>] per array dimension.
+    std::string section;
     while (arrType) {
         SgExpression* index = arrType->get_index();
         if (!index) return name;
         std::string dim = index->unparseToString();
         if (dim.empty()) return name;
-        if (sizeStr.empty()) {
-            sizeStr = dim;
-        } else {
-            sizeStr = "(" + sizeStr + ") * (" + dim + ")";
-        }
+        section += "[0:" + dim + "]";
         SgType* baseType = arrType->get_base_type();
         if (!baseType) break;
         baseType = baseType->stripType(SgType::STRIP_MODIFIER_TYPE | SgType::STRIP_TYPEDEF_TYPE);
         arrType = isSgArrayType(baseType);
     }
 
-    if (sizeStr.empty()) return name;
-    return name + "[0:" + sizeStr + "]";
+    if (section.empty()) return name;
+    return name + section;
 }
 
 std::string OpenMPCodeGen::buildMapClause(
@@ -275,6 +292,20 @@ static size_t findPragmaEnd(const std::string& source, size_t pragmaStart) {
         if (nl == 0 || source[nl - 1] != '\\') return nl;
         pos = nl + 1;
     }
+}
+
+// Find the ')' that matches the '(' at `open`, counting nested parentheses so
+// array sections like "A[0:(1024) * (1024)]" are handled as a single unit.
+static size_t findMatchingParen(const std::string& s, size_t open) {
+    int depth = 0;
+    for (size_t i = open; i < s.size(); ++i) {
+        if (s[i] == '(') ++depth;
+        else if (s[i] == ')') {
+            --depth;
+            if (depth == 0) return i;
+        }
+    }
+    return std::string::npos;
 }
 
 // Find the end of the for-statement that starts at forStart (skip its body).
@@ -400,8 +431,9 @@ std::set<std::string> OpenMPCodeGen::collectMappedVars(const std::string& pragma
     size_t pos = 0;
     while ((pos = pragmaText.find("map(", pos)) != std::string::npos) {
         size_t open = pragmaText.find('(', pos);
-        size_t close = pragmaText.find(')', open);
-        if (open == std::string::npos || close == std::string::npos) break;
+        if (open == std::string::npos) break;
+        size_t close = findMatchingParen(pragmaText, open);
+        if (close == std::string::npos) break;
 
         std::string inside = pragmaText.substr(open + 1, close - open - 1);
         size_t colon = inside.find(':');
@@ -445,7 +477,9 @@ std::string OpenMPCodeGen::stripTargetAndMap(const std::string& pragmaText) {
     // Only remove the per-loop map clauses.
     size_t pos = 0;
     while ((pos = result.find(" map(", pos)) != std::string::npos) {
-        size_t close = result.find(')', pos);
+        size_t open = result.find('(', pos);
+        if (open == std::string::npos) break;
+        size_t close = findMatchingParen(result, open);
         if (close == std::string::npos) break;
         result.erase(pos, close - pos + 1);
     }

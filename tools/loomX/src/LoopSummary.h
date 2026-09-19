@@ -35,6 +35,11 @@ struct LoopSummary {
     // Map clauses for GPU target regions, grouped by direction.
     std::set<std::pair<SgInitializedName*, std::string>> mapClauses;
 
+    // Perfect-nest depth for "collapse(N)" on the GPU pragma.  1 means the loop
+    // is collapsed by itself (no collapse clause).  Computed for GPU-offloaded
+    // loops by GpuProfitability::collapseDepthFor.
+    int collapseDepth = 1;
+
     // Helper: collect just the reduction variables.
     std::set<SgInitializedName*> getReductionVariables() const {
         std::set<SgInitializedName*> vars;

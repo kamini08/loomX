@@ -562,9 +562,6 @@ loomX::LoopSummary buildSummary(SgForStatement* loop,
 
     // Fill codegen inputs.
     fillPrivateVars(loop, summary);
-    if (summary.target == ParallelTarget::GPU_OFFLOAD) {
-        fillMapVariables(loop, summary);
-    }
 
     return summary;
 }
@@ -583,6 +580,7 @@ int main(int argc, char* argv[]) {
     bool intraproceduralBaseline = false;
     bool scalarDepCheck = true;
     bool strictRaceSafety = false;
+    bool phaseCouple = true;
     TranslationMode mode = TranslationMode::GPU_PROFITABLE;
     loomX::ProfitabilityConfig config;
     std::string explicitOutputFile;
@@ -603,6 +601,8 @@ int main(int argc, char* argv[]) {
             mode = TranslationMode::GPU_NAIVE;
         } else if (arg == "--gpu-profitable") {
             mode = TranslationMode::GPU_PROFITABLE;
+        } else if (arg == "--no-phase-couple") {
+            phaseCouple = false;
         } else if (arg == "--analyze-only") {
             mode = TranslationMode::ANALYZE_ONLY;
         } else if (arg == "--min-gpu-speedup" && i + 1 < argc) {
@@ -615,6 +615,20 @@ int main(int argc, char* argv[]) {
             config.computeBoundThreshold = std::stod(argv[++i]);
         } else if (arg == "--gpu-compute-efficiency" && i + 1 < argc) {
             config.gpuComputeEfficiency = std::stod(argv[++i]);
+        } else if (arg == "--gpu-compute-throughput" && i + 1 < argc) {
+            config.gpuComputeThroughput = std::stod(argv[++i]);
+        } else if (arg == "--gpu-mem-bandwidth" && i + 1 < argc) {
+            config.gpuMemoryBandwidth = std::stod(argv[++i]);
+        } else if (arg == "--cpu-mem-bandwidth" && i + 1 < argc) {
+            config.cpuMemoryBandwidth = std::stod(argv[++i]);
+        } else if (arg == "--cpu-core-count" && i + 1 < argc) {
+            config.cpuCoreCount = std::stoi(argv[++i]);
+        } else if (arg == "--pcie-bandwidth" && i + 1 < argc) {
+            config.pcieBandwidth = std::stod(argv[++i]);
+        } else if (arg == "--pcie-latency" && i + 1 < argc) {
+            config.pcieLatency = std::stod(argv[++i]);
+        } else if (arg == "--kernel-launch-overhead" && i + 1 < argc) {
+            config.kernelLaunchOverhead = std::stod(argv[++i]);
         } else if (arg == "--heavy-math-cost" && i + 1 < argc) {
             config.heavyMathCostFactor = std::stod(argv[++i]);
         } else if (arg == "--pcie-factor" && i + 1 < argc) {
@@ -635,8 +649,13 @@ int main(int argc, char* argv[]) {
                   << " [-v|--verbose] [--intraprocedural-baseline] [--no-scalar-dep-check]"
                   << " [--strict-race-safety]"
                   << " [--cpu-only|--gpu-naive|--gpu-profitable|--analyze-only]"
+                  << " [--no-phase-couple]"
                   << " [--min-gpu-speedup <f>] [--min-nested-flop <n>]"
                   << " [--min-total-flop <n>] [--compute-bound-threshold <f>]"
+                  << " [--pcie-factor <f>] [--gpu-compute-throughput <f>]"
+                  << " [--gpu-mem-bandwidth <f>] [--pcie-bandwidth <f>]"
+                  << " [--cpu-core-count <n>] [--cpu-mem-bandwidth <f>]"
+                  << " [--kernel-launch-overhead <f>] [--pcie-latency <f>]"
                   << " <input.c> [-o output.c]\n";
         return 1;
     }
@@ -690,6 +709,12 @@ int main(int argc, char* argv[]) {
     int skipped = 0;
     std::set<SgForStatement*> parallelizedLoops;
 
+    // Loops accepted for transformation, in program order, with a flag marking
+    // helper (init_array) loops that should only be transformed if the
+    // phase-coupling pass later promotes them to the GPU.
+    std::vector<std::pair<loomX::LoopSummary, bool>> accepted;
+    std::set<SgForStatement*> selectedLoops;
+
     for (SgForStatement* loop : collector.loops) {
         std::cout << "\nProcessing loop at line "
                   << loop->get_file_info()->get_line() << "\n";
@@ -697,20 +722,24 @@ int main(int argc, char* argv[]) {
         // Skip initialization / output helpers in benchmark suites; their
         // correctness matters for end-to-end validation and they frequently
         // contain reduction patterns (e.g. PolyBench init_array) that are not
-        // the target of kernel parallelization.
+        // the target of kernel parallelization.  init_array loops are kept as
+        // candidates so the phase-coupling pass can offload them when a later
+        // GPU loop consumes the data they write; output helpers are never
+        // touched.
         std::string funcName = getEnclosingFunctionName(loop);
-        if (funcName == "init_array" || funcName == "print_array") {
+        if (funcName == "print_array") {
             std::cout << "  -> Skipped: loop inside " << funcName << "\n";
             skipped++;
             continue;
         }
+        bool initHelperLoop = (funcName == "init_array");
 
         // Skip loops nested inside already-parallelized loops
         bool nested = false;
         SgNode* parent = loop->get_parent();
         while (parent) {
             if (SgForStatement* parentLoop = isSgForStatement(parent)) {
-                if (parallelizedLoops.find(parentLoop) != parallelizedLoops.end()) {
+                if (selectedLoops.find(parentLoop) != selectedLoops.end()) {
                     std::cout << "  -> Skipped: nested inside already-parallelized loop\n";
                     nested = true;
                     break;
@@ -783,27 +812,46 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // Apply translation-mode override for ablation experiments.
-        if (mode == TranslationMode::CPU_ONLY) {
-            if (summary.target != ParallelTarget::SEQUENTIAL) {
-                summary.target = ParallelTarget::CPU_OPENMP;
+        // Apply translation-mode override for ablation experiments.  init_array
+        // helper loops are excluded: phase-coupling is a profitable-pipeline
+        // concept, so the ablation modes keep their previous (untouched)
+        // behavior for helper loops.
+        if (!initHelperLoop) {
+            if (mode == TranslationMode::CPU_ONLY) {
+                if (summary.target != ParallelTarget::SEQUENTIAL) {
+                    summary.target = ParallelTarget::CPU_OPENMP;
+                }
+            } else if (mode == TranslationMode::GPU_NAIVE) {
+                if (summary.target != ParallelTarget::SEQUENTIAL) {
+                    summary.target = ParallelTarget::GPU_OFFLOAD;
+                }
             }
-        } else if (mode == TranslationMode::GPU_NAIVE) {
-            if (summary.target != ParallelTarget::SEQUENTIAL) {
-                summary.target = ParallelTarget::GPU_OFFLOAD;
-            }
+        }
+
+        // Compute data-motion clauses for any loop that will actually be
+        // offloaded.  This runs after the mode override so that ablation runs
+        // (--gpu-naive) get correct maps for loops the cost model would have
+        // kept on the CPU.
+        if (summary.target == ParallelTarget::GPU_OFFLOAD) {
+            fillMapVariables(loop, summary);
         }
 
         // Apply the cost-model decision.
         if (summary.target == ParallelTarget::SEQUENTIAL) {
-            if (mode == TranslationMode::ANALYZE_ONLY) {
-                std::cout << "REJECTED line "
-                          << loop->get_file_info()->get_line()
-                          << ": not profitable / not safe\n";
-            } else {
-                std::cout << "  -> Not profitable to parallelize\n";
+            if (!initHelperLoop) {
+                if (mode == TranslationMode::ANALYZE_ONLY) {
+                    std::cout << "REJECTED line "
+                              << loop->get_file_info()->get_line()
+                              << ": not profitable / not safe\n";
+                } else {
+                    std::cout << "  -> Not profitable to parallelize\n";
+                }
+                skipped++;
+                continue;
             }
-            skipped++;
+            // init_array loop: keep as coupling candidate.  It only receives a
+            // pragma if phase-coupling later promotes it to the GPU.
+            accepted.push_back({summary, true});
             continue;
         }
 
@@ -821,16 +869,56 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // Insert OpenMP directives based on the summary.
-        codegen.generatePragmas(summary);
-        parallelizedLoops.insert(loop);
+        // Defer code generation until the phase-coupling pass has run (so it
+        // can promote init_array loops to GPU and the same-function target-data
+        // hoister can merge them with the consuming GPU loops).
+        selectedLoops.insert(loop);
+        accepted.push_back({summary, initHelperLoop});
+    }
 
-        if (summary.target == ParallelTarget::GPU_OFFLOAD) {
-            std::cout << "  -> GPU offload pragma inserted\n";
-        } else {
-            std::cout << "  -> CPU OpenMP pragma inserted\n";
+    // Phase-couple init loops with subsequent GPU loops, then emit all
+    // transformed sources in program order.  Coupling is a profitable-pipeline
+    // rule; the ablation modes keep their previous, untouched behavior for
+    // init_array helpers.
+    if (mode == TranslationMode::GPU_PROFITABLE && phaseCouple &&
+        !accepted.empty()) {
+        std::vector<loomX::LoopSummary> summaries;
+        summaries.reserve(accepted.size());
+        for (const auto& entry : accepted) summaries.push_back(entry.first);
+        profitability.phaseCoupleInitLoops(summaries);
+
+        for (size_t i = 0; i < accepted.size(); ++i) {
+            accepted[i].first = summaries[i];
         }
-        parallelized++;
+    }
+
+    for (auto& entry : accepted) {
+            loomX::LoopSummary& summary = entry.first;
+            bool coupleOnly = entry.second;
+
+            // Untouched helper loop: never emitted a pragma before, keep it.
+            if (coupleOnly && summary.target != ParallelTarget::GPU_OFFLOAD) {
+                continue;
+            }
+
+            if (summary.target == ParallelTarget::GPU_OFFLOAD &&
+                summary.mapClauses.empty()) {
+                fillMapVariables(summary.loop, summary);
+            }
+            if (summary.target == ParallelTarget::GPU_OFFLOAD) {
+                summary.collapseDepth = profitability.collapseDepthFor(summary.loop);
+            }
+
+            // Insert OpenMP directives based on the summary.
+            codegen.generatePragmas(summary);
+            parallelizedLoops.insert(summary.loop);
+
+            if (summary.target == ParallelTarget::GPU_OFFLOAD) {
+                std::cout << "  -> GPU offload pragma inserted\n";
+            } else {
+                std::cout << "  -> CPU OpenMP pragma inserted\n";
+            }
+            parallelized++;
     }
 
     std::cout << "\n=== Summary ===\n";

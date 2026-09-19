@@ -25,6 +25,24 @@ public:
     // modified (e.g. after adding interprocedural callee work estimates).
     void reevaluateTarget(loomX::LoopSummary& summary);
 
+    // Phase-couple initialization loops with a later GPU loop: if an init loop
+    // writes arrays that a GPU_OFFLOAD loop later in program order consumes,
+    // force the init loop onto the GPU too so the data is produced on the
+    // device instead of ping-ponging across PCIe.  Loops are left untouched
+    // unless every non-GPU loop between them avoids the written arrays (a CPU
+    // reader in between would observe stale host data).  [in,out] summaries
+    // must be in program order.
+    void phaseCoupleInitLoops(std::vector<loomX::LoopSummary>& summaries);
+
+    // Compute the perfect-nest depth for a "collapse(N)" clause on a
+    // GPU-offloaded loop.  Returns >= 2 when the loop heads a perfect nest of
+    // inner loops that are all canonical AND carry no loop-carried dependence
+    // (flattening such a 2D/3D fan improves GPU occupancy without introducing
+    // cross-iteration races on shared accumulators, so e.g. the dot-product
+    // k-loop of gemm is correctly NOT flattened).  Returns 1 when nothing can
+    // be collapsed.
+    int collapseDepthFor(SgForStatement* loop);
+
     // Access the underlying analyzers for detailed diagnostics.
     loomX::LoopCanonicalChecker& getCanonicalChecker() { return canonicalChecker_; }
     loomX::IterationCountEstimator& getIterationEstimator() { return iterationEstimator_; }
