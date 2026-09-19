@@ -1,4 +1,5 @@
 #pragma once
+#include "CodeGen.h"
 #include "rose.h"
 #include "LoopSummary.h"
 #include <set>
@@ -6,7 +7,7 @@
 #include <vector>
 
 // OpenMP pragma generation driven by a LoopSummary.
-class OpenMPCodeGen {
+class OpenMPCodeGen : public CodeGen {
 public:
     // Insert all OpenMP directives required by the summary decision.
     // For GPU_OFFLOAD this includes:
@@ -19,8 +20,10 @@ public:
 
     // Text-based post-processing: rewrite the unparsed source so that
     // consecutive GPU-offload loops are wrapped in a single
-    // #pragma omp target data region. This avoids fragile AST rewrites for
-    // the structured block and is applied after project->unparse().
+    // #pragma omp target data region, and prepend #include <omp.h> if missing.
+    void postProcessSource(std::string& source) override;
+
+    // Helper used by postProcessSource.
     static void hoistTargetDataRegions(std::string& source);
 
 private:

@@ -616,3 +616,14 @@ std::string OpenMPCodeGen::stripTargetAndMap(const std::string& pragmaText) {
 
     return result;
 }
+
+void OpenMPCodeGen::postProcessSource(std::string& source) {
+    // Hoist consecutive target loops into shared target data regions.
+    hoistTargetDataRegions(source);
+
+    // Make sure the OpenMP runtime header is present.
+    if (source.find("#include <omp.h>") == std::string::npos &&
+        source.find("#include \"omp.h\"") == std::string::npos) {
+        source = std::string("#include <omp.h>\n\n") + source;
+    }
+}

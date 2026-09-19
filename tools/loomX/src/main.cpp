@@ -1,7 +1,9 @@
 #include "rose.h"
+#include "CodeGen.h"
 #include "InterproceduralAnalysis.h"
 #include "GpuProfitability.h"
 #include "OpenMPCodeGen.h"
+#include "OpenACCCodeGen.h"
 #include "LoopSummary.h"
 #include "LoopDependenceAnalysis.h"
 #include "PragmaAnalysis.h"
@@ -10,6 +12,7 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
+#include <memory>
 
 using namespace loomX;
 
@@ -584,6 +587,7 @@ int main(int argc, char* argv[]) {
     TranslationMode mode = TranslationMode::GPU_PROFITABLE;
     loomX::ProfitabilityConfig config;
     std::string explicitOutputFile;
+    std::string targetBackend = "openmp";
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
@@ -601,6 +605,8 @@ int main(int argc, char* argv[]) {
             mode = TranslationMode::GPU_NAIVE;
         } else if (arg == "--gpu-profitable") {
             mode = TranslationMode::GPU_PROFITABLE;
+        } else if (arg == "--target-backend" && i + 1 < argc) {
+            targetBackend = argv[++i];
         } else if (arg == "--no-phase-couple") {
             phaseCouple = false;
         } else if (arg == "--analyze-only") {
@@ -651,6 +657,7 @@ int main(int argc, char* argv[]) {
                   << " [-v|--verbose] [--intraprocedural-baseline] [--no-scalar-dep-check]"
                   << " [--strict-race-safety]"
                   << " [--cpu-only|--gpu-naive|--gpu-profitable|--analyze-only]"
+                  << " [--target-backend <openmp|openacc>]"
                   << " [--no-phase-couple]"
                   << " [--min-gpu-speedup <f>] [--min-nested-flop <n>]"
                   << " [--min-total-flop <n>] [--min-cpu-openmp-flop <n>]"
@@ -706,7 +713,12 @@ int main(int argc, char* argv[]) {
     // Step 3: Analyze and transform each loop
     std::cout << "\n=== Phase 3: Parallelization ===\n";
     GpuProfitability profitability(config);
-    OpenMPCodeGen codegen;
+    std::unique_ptr<CodeGen> codegen;
+    if (targetBackend == "openacc") {
+        codegen = std::make_unique<OpenACCCodeGen>();
+    } else {
+        codegen = std::make_unique<OpenMPCodeGen>();
+    }
 
     int parallelized = 0;
     int skipped = 0;
@@ -912,8 +924,8 @@ int main(int argc, char* argv[]) {
                 summary.collapseDepth = profitability.collapseDepthFor(summary.loop);
             }
 
-            // Insert OpenMP directives based on the summary.
-            codegen.generatePragmas(summary);
+            // Insert backend-specific directives based on the summary.
+            codegen->generatePragmas(summary);
             parallelizedLoops.insert(summary.loop);
 
             if (summary.target == ParallelTarget::GPU_OFFLOAD) {
@@ -952,14 +964,9 @@ int main(int argc, char* argv[]) {
                                          std::istreambuf_iterator<char>());
                     inFile.close();
 
-                    // Hoist target data regions (text-based).
-                    OpenMPCodeGen::hoistTargetDataRegions(content);
-
-                    // Check if omp.h is already included.
-                    if (content.find("#include <omp.h>") == std::string::npos &&
-                        content.find("#include \"omp.h\"") == std::string::npos) {
-                        content = std::string("#include <omp.h>\n\n") + content;
-                    }
+                    // Backend-specific post-processing (e.g. target-data
+                    // hoisting for OpenMP, header injection for OpenACC).
+                    codegen->postProcessSource(content);
 
                     std::ofstream outFile(outputName);
                     if (outFile) {
