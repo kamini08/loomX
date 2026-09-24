@@ -6,6 +6,7 @@
 #include "OpenACCCodeGen.h"
 #include "CudaCodeGen.h"
 #include "OpenCLCodeGen.h"
+#include "KernelCodeGen.h"
 #include "LoopSummary.h"
 #include "LoopDependenceAnalysis.h"
 #include "PragmaAnalysis.h"
@@ -587,9 +588,9 @@ int main(int argc, char* argv[]) {
     bool strictRaceSafety = false;
     bool phaseCouple = true;
     TranslationMode mode = TranslationMode::GPU_PROFITABLE;
+    loomX::CodeGenBackend backend = loomX::CodeGenBackend::OMP;
     loomX::ProfitabilityConfig config;
     std::string explicitOutputFile;
-    std::string targetBackend = "openmp";
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
@@ -607,8 +608,21 @@ int main(int argc, char* argv[]) {
             mode = TranslationMode::GPU_NAIVE;
         } else if (arg == "--gpu-profitable") {
             mode = TranslationMode::GPU_PROFITABLE;
-        } else if (arg == "--target-backend" && i + 1 < argc) {
-            targetBackend = argv[++i];
+        } else if (arg == "--backend" && i + 1 < argc) {
+            std::string b = argv[++i];
+            if (b == "omp") {
+                backend = loomX::CodeGenBackend::OMP;
+            } else if (b == "cuda") {
+                backend = loomX::CodeGenBackend::CUDA;
+            } else if (b == "opencl") {
+                backend = loomX::CodeGenBackend::OPENCL;
+            } else if (b == "openacc") {
+                backend = loomX::CodeGenBackend::OPENACC;
+            } else {
+                std::cerr << "Unknown backend '" << b
+                          << "' (expected omp|cuda|opencl|openacc)\n";
+                return 1;
+            }
         } else if (arg == "--no-phase-couple") {
             phaseCouple = false;
         } else if (arg == "--analyze-only") {
@@ -659,7 +673,7 @@ int main(int argc, char* argv[]) {
                   << " [-v|--verbose] [--intraprocedural-baseline] [--no-scalar-dep-check]"
                   << " [--strict-race-safety]"
                   << " [--cpu-only|--gpu-naive|--gpu-profitable|--analyze-only]"
-                  << " [--target-backend <openmp|openacc|cuda|opencl>]"
+                  << " [--backend omp|cuda|opencl|openacc]"
                   << " [--no-phase-couple]"
                   << " [--min-gpu-speedup <f>] [--min-nested-flop <n>]"
                   << " [--min-total-flop <n>] [--min-cpu-openmp-flop <n>]"
@@ -716,15 +730,19 @@ int main(int argc, char* argv[]) {
     std::cout << "\n=== Phase 3: Parallelization ===\n";
     GpuProfitability profitability(config);
     std::unique_ptr<CodeGen> codegen;
-    if (targetBackend == "openacc") {
-        codegen = std::make_unique<OpenACCCodeGen>();
-    } else if (targetBackend == "cuda") {
-        codegen = std::make_unique<CudaCodeGen>();
-    } else if (targetBackend == "opencl") {
-        codegen = std::make_unique<OpenCLCodeGen>();
+    std::unique_ptr<loomX::KernelCodeGen> kernelCodegen;
+    if (backend == loomX::CodeGenBackend::CUDA ||
+        backend == loomX::CodeGenBackend::OPENCL) {
+        // Kernel-extraction backends: GPU loops become device kernels; loops
+        // that cannot be kernelized fall back to a CPU OpenMP pragma.
+        kernelCodegen.reset(new loomX::KernelCodeGen(backend));
+        codegen.reset(new OpenMPCodeGen());
+    } else if (backend == loomX::CodeGenBackend::OPENACC) {
+        codegen.reset(new OpenACCCodeGen());
     } else {
-        codegen = std::make_unique<OpenMPCodeGen>();
+        codegen.reset(new OpenMPCodeGen());
     }
+    bool openmpInOutput = false;  // CPU-OpenMP pragmas beside device kernels
 
     int parallelized = 0;
     int skipped = 0;
@@ -930,9 +948,34 @@ int main(int argc, char* argv[]) {
                 summary.collapseDepth = profitability.collapseDepthFor(summary.loop);
             }
 
-            // Insert backend-specific directives based on the summary.
+// CUDA/OpenCL backends: extract GPU-offload loops into device
+            // kernels; loops that cannot be kernelized fall back to the CPU.
+            if (kernelCodegen && summary.target == ParallelTarget::GPU_OFFLOAD) {
+                if (kernelCodegen->generate(summary.loop, summary)) {
+                    parallelizedLoops.insert(summary.loop);
+                    std::cout << "  -> "
+                              << (backend == loomX::CodeGenBackend::CUDA
+                                      ? "CUDA" : "OpenCL")
+                              << " kernel extracted\n";
+                    parallelized++;
+                    continue;
+                }
+                summary.target = ParallelTarget::CPU_OPENMP;
+                codegen->generatePragmas(summary);
+                parallelizedLoops.insert(summary.loop);
+                openmpInOutput = true;
+                std::cout << "  -> fallback: CPU OpenMP pragma inserted\n";
+                parallelized++;
+                continue;
+            }
+
+            // Insert the selected backend's directives based on the summary.
             codegen->generatePragmas(summary);
             parallelizedLoops.insert(summary.loop);
+
+            if (summary.target == ParallelTarget::CPU_OPENMP) {
+                openmpInOutput = true;
+            }
 
             if (summary.target == ParallelTarget::GPU_OFFLOAD) {
                 std::cout << "  -> GPU offload pragma inserted\n";
@@ -970,9 +1013,16 @@ int main(int argc, char* argv[]) {
                                          std::istreambuf_iterator<char>());
                     inFile.close();
 
-                    // Backend-specific post-processing (e.g. target-data
-                    // hoisting for OpenMP, header injection for OpenACC).
-                    codegen->postProcessSource(content);
+                    if (kernelCodegen && kernelCodegen->kernelCount() > 0) {
+                        // CUDA/OpenCL: splice kernel + launcher definitions at
+                        // the bottom, prototypes near the top, and the device
+                        // runtime include (plus <omp.h> for mixed-target loops).
+                        kernelCodegen->finalizeOutput(content, openmpInOutput);
+                    } else {
+                        // Backend-specific post-processing (e.g. target-data
+                        // hoisting for OpenMP, header injection for OpenACC).
+                        codegen->postProcessSource(content);
+                    }
 
                     std::ofstream outFile(outputName);
                     if (outFile) {

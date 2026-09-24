@@ -7,6 +7,11 @@ namespace loomX {
 // Target for parallelized loop.
 enum class ParallelTarget { SEQUENTIAL, CPU_OPENMP, GPU_OFFLOAD };
 
+// Emission backend for the transformed source.  OpenMP is the classic pragma
+// codegen; CUDA and OPENCL extract the loop body into a device kernel plus a
+// host-side launcher stub.
+enum class CodeGenBackend { OMP, CUDA, OPENCL, OPENACC };
+
 // Tunable parameters for the GPU profitability cost model.
 struct ProfitabilityConfig {
     // Default iteration count used when the loop bound is symbolic and cannot

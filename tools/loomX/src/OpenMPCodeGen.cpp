@@ -21,6 +21,10 @@ void OpenMPCodeGen::generatePragmas(const loomX::LoopSummary& summary) {
     }
 }
 
+void OpenMPCodeGen::generateCPUPragma(const loomX::LoopSummary& summary) {
+    insertCPUPragma(summary);
+}
+
 void OpenMPCodeGen::insertCPUPragma(const loomX::LoopSummary& summary) {
     SgForStatement* loop = summary.loop;
     if (!loop) return;
@@ -618,7 +622,7 @@ std::string OpenMPCodeGen::stripTargetAndMap(const std::string& pragmaText) {
 }
 
 void OpenMPCodeGen::postProcessSource(std::string& source) {
-    // Hoist consecutive target loops into shared target data regions.
+    // Hoist consecutive GPU-offload loops into shared target data regions.
     hoistTargetDataRegions(source);
 
     // Make sure the OpenMP runtime header is present.
