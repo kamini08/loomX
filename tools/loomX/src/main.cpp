@@ -861,9 +861,11 @@ int main(int argc, char* argv[]) {
                     summary.target = ParallelTarget::CPU_OPENMP;
                 }
             } else if (mode == TranslationMode::GPU_NAIVE) {
-                if (summary.target != ParallelTarget::SEQUENTIAL) {
-                    summary.target = ParallelTarget::GPU_OFFLOAD;
-                }
+                // Ablation mode: bypass the profitability gate entirely.  Every
+                // loop that passed the safety checks is offloaded, including
+                // ones the cost model marked SEQUENTIAL (e.g. below the
+                // CPU-OpenMP FLOP threshold).
+                summary.target = ParallelTarget::GPU_OFFLOAD;
             }
         }
 
