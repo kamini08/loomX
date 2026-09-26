@@ -60,7 +60,12 @@ private:
     loomX::ComputeIntensityEstimator intensityEstimator_;
     loomX::ProfitabilityConfig config_;
 
-    loomX::ParallelTarget decideTarget(const loomX::LoopSummary& summary);
+    // `passLabel` only affects the diagnostic line. The target is decided
+    // twice on purpose: once from purely local information, then again after
+    // interprocedural callee work has been folded into the intensity estimate.
+    // The second verdict is the one that is acted on.
+    loomX::ParallelTarget decideTarget(const loomX::LoopSummary& summary,
+                                       const char* passLabel = "local");
 
     // Cost-model estimates (abstract time units).
     double estimateCpuTime(const loomX::LoopSummary& summary) const;

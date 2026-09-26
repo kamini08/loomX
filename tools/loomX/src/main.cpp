@@ -572,8 +572,53 @@ loomX::LoopSummary buildSummary(SgForStatement* loop,
     return summary;
 }
 
+// Explain *why* the cost model left a loop sequential. Kept separate from the
+// decision itself so the analyze-only report stays a faithful account of the
+// thresholds in GpuProfitability::decideTarget rather than a paraphrase.
+static std::string describeRejection(const LoopSummary& summary,
+                                    const ProfitabilityConfig& config) {
+    using DivergenceKind = loomX::DivergenceKind;
+
+    const bool stronglyDivergent =
+        summary.divergence.isDivergent &&
+        summary.divergence.kind != DivergenceKind::FUNCTION_CALL &&
+        summary.divergence.kind != DivergenceKind::INNER_LOOP;
+
+    if (!summary.regularAccess) {
+        return "unsafe: irregular or unanalyzable memory access pattern";
+    }
+    if (stronglyDivergent) {
+        return "unsafe: data-dependent control flow in the loop body";
+    }
+    if (summary.hasFunctionCalls && !summary.allFunctionCallsSafe) {
+        return "unsafe: callee may have side effects (interprocedural)";
+    }
+    if (summary.iterationCount >= 0 &&
+        summary.iterationCount < config.minIterationsForParallel) {
+        return "cost: trip count " + std::to_string(summary.iterationCount) +
+               " below the parallel threshold (" +
+               std::to_string(config.minIterationsForParallel) + ")";
+    }
+    if (summary.intensity.flopCount < config.minTotalFlopForCPUOpenMP) {
+        return "cost: " + std::to_string(summary.intensity.flopCount) +
+               " FLOP below the CPU-OpenMP threshold (" +
+               std::to_string(config.minTotalFlopForCPUOpenMP) +
+               "); raise it with --min-cpu-openmp-flop to override";
+    }
+    return "cost: model predicts no gain over sequential";
+}
+
 enum class TranslationMode {
-    CPU_ONLY,        // Force CPU OpenMP for all safe loops.
+    // Parallelize with CPU OpenMP any loop the cost model already considered
+    // worthwhile. Loops below minTotalFlopForCPUOpenMP are still left serial,
+    // because threading them costs more than it saves. Use this as the
+    // "tuned CPU" arm.
+    CPU_ONLY,
+    // Ablation arm: force CPU OpenMP for every loop that passes the safety
+    // checks, ignoring the work thresholds. This is the true forced-CPU arm
+    // needed to measure offload decision regret, and the CPU-side counterpart
+    // of GPU_NAIVE. It can be slower than sequential on tiny loops by design.
+    CPU_FORCED,
     GPU_NAIVE,       // Offload every safe loop to GPU (profitability gate off).
     GPU_PROFITABLE,  // Use profitability model to choose CPU vs GPU (default).
     ANALYZE_ONLY,    // Report per-loop verdicts without transforming the source.
@@ -604,6 +649,8 @@ int main(int argc, char* argv[]) {
             strictRaceSafety = true;
         } else if (arg == "--cpu-only") {
             mode = TranslationMode::CPU_ONLY;
+        } else if (arg == "--cpu-forced") {
+            mode = TranslationMode::CPU_FORCED;
         } else if (arg == "--gpu-naive") {
             mode = TranslationMode::GPU_NAIVE;
         } else if (arg == "--gpu-profitable") {
@@ -672,7 +719,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Usage: " << argv[0]
                   << " [-v|--verbose] [--intraprocedural-baseline] [--no-scalar-dep-check]"
                   << " [--strict-race-safety]"
-                  << " [--cpu-only|--gpu-naive|--gpu-profitable|--analyze-only]"
+                  << " [--cpu-only|--cpu-forced|--gpu-naive|--gpu-profitable|--analyze-only]"
                   << " [--backend omp|cuda|opencl|openacc]"
                   << " [--no-phase-couple]"
                   << " [--min-gpu-speedup <f>] [--min-nested-flop <n>]"
@@ -860,6 +907,19 @@ int main(int argc, char* argv[]) {
                 if (summary.target != ParallelTarget::SEQUENTIAL) {
                     summary.target = ParallelTarget::CPU_OPENMP;
                 }
+            } else if (mode == TranslationMode::CPU_FORCED) {
+                // Ablation mode: the CPU-side counterpart of --gpu-naive.
+                // Every loop that reached this point has already passed the
+                // safety checks (dependence, divergence, call safety). The
+                // only floor is a trip-count minimum, so that degenerate
+                // single-trip or two-trip loops are not threaded; the FLOP
+                // thresholds are deliberately ignored, because the point of
+                // this mode is to measure what "always parallelize on the
+                // CPU" costs, including on loops where it loses to sequential.
+                if (summary.iterationCount >= 0 &&
+                    summary.iterationCount >= config.minIterationsForCPU) {
+                    summary.target = ParallelTarget::CPU_OPENMP;
+                }
             } else if (mode == TranslationMode::GPU_NAIVE) {
                 // Ablation mode: bypass the profitability gate entirely.  Every
                 // loop that passed the safety checks is offloaded, including
@@ -881,9 +941,14 @@ int main(int argc, char* argv[]) {
         if (summary.target == ParallelTarget::SEQUENTIAL) {
             if (!initHelperLoop) {
                 if (mode == TranslationMode::ANALYZE_ONLY) {
+                    // Report why, not just that. "not profitable / not safe"
+                    // conflated a safety rejection with a cost-model one, which
+                    // made the analyze-only verdicts impossible to act on: a
+                    // loop rejected for irregular access needs a different fix
+                    // than one rejected for being under the work threshold.
                     std::cout << "REJECTED line "
                               << loop->get_file_info()->get_line()
-                              << ": not profitable / not safe\n";
+                              << ": " << describeRejection(summary, config) << "\n";
                 } else {
                     std::cout << "  -> Not profitable to parallelize\n";
                 }

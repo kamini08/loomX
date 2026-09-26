@@ -263,7 +263,7 @@ double GpuProfitability::estimateGpuTime(const loomX::LoopSummary& summary) cons
 }
 
 void GpuProfitability::reevaluateTarget(loomX::LoopSummary& summary) {
-    summary.target = decideTarget(summary);
+    summary.target = decideTarget(summary, "callee-augmented");
 }
 
 void GpuProfitability::phaseCoupleInitLoops(
@@ -355,12 +355,14 @@ void GpuProfitability::phaseCoupleInitLoops(
     }
 }
 
-ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary) {
+ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary,
+                                              const char* passLabel) {
     SgForStatement* loop = summary.loop;
 
     // Non-canonical loops cannot be safely parallelized.
     if (summary.canonical.form != loomX::CanonicalForm::CANONICAL) {
-        std::cout << "[GpuProfitability] Loop at line "
+        std::cout << "[GpuProfitability] pass=" << passLabel
+                  << " Loop at line "
                   << loop->get_file_info()->get_line()
                   << " non-canonical (" << summary.canonical.note << ")\n";
         return ParallelTarget::SEQUENTIAL;
@@ -385,7 +387,8 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary)
     double gpuTime = estimateGpuTime(summary);
     double speedup = (gpuTime > 0.0) ? (cpuTime / gpuTime) : 0.0;
 
-    std::cout << "[GpuProfitability] Loop at line "
+    std::cout << "[GpuProfitability] pass=" << passLabel
+              << " Loop at line "
               << loop->get_file_info()->get_line()
               << " iterations=" << iterations
               << " regular=" << regular
