@@ -459,8 +459,7 @@ bool linearizeSubscripts(SgStatement* body,
 
     for (SgPntrArrRefExp* top : tops) {
         SgVarRefExp* baseRef = nullptr;
-        SgExpression* chain = top->get_lhs_operand();
-        SgExpression* base = chain;
+        SgExpression* base = top->get_lhs_operand();
         while (SgPntrArrRefExp* inner = isSgPntrArrRefExp(base)) {
             base = inner->get_lhs_operand();
         }
@@ -475,16 +474,31 @@ bool linearizeSubscripts(SgStatement* body,
         if (!arrayDims(var->get_type(), dims)) continue;
         if (dims.size() < 2) continue;  // 1-D already flat
 
-        // Collect subscripts in source order: A[i][j] -> {i, j}, which is also
-        // outermost-dim-first, matching the order produced by arrayDims().
+        // Collect subscripts outermost-dim-first so they line up with
+        // arrayDims(), which also walks the array type from the outside in.
+        //
+        // Start the walk at `top` (the outermost SgPntrArrRefExp, i.e. `u[a]`
+        // in `u[a][b][c]`) and visit every node in the chain, then reverse.
+        // Walking that chain yields the subscripts innermost-first, so the
+        // reverse puts them back in outermost-first order.
+        //
+        // The previous form started at `chain` (`top->get_lhs_operand()`, i.e.
+        // `(u[a])[b]`) and appended `top`'s own rhs last, which skipped
+        // `top`'s node in the walk and mis-ordered its subscript. For
+        // `u[0][j][i]` against dims {2, 1026, 1026} it produced {j, 0, i}
+        // instead of {0, j, i}, emitting `j*1026*1026 + 0*1026 + i`. Note this
+        // is not a plain transposition: because dims[0]==dims[1] here, the
+        // result still addresses in-bounds memory on a square array, so it
+        // silently computed the wrong values rather than trapping. On a
+        // non-square array the same mistake walks off the end of the
+        // allocation and surfaces as a CUDA launch failure.
         std::vector<SgExpression*> indices;
-        SgExpression* e = chain;
-        while (SgPntrArrRefExp* inner = isSgPntrArrRefExp(e)) {
-            indices.push_back(inner->get_rhs_operand());
-            e = inner->get_lhs_operand();
+        SgExpression* e = top;
+        while (SgPntrArrRefExp* node = isSgPntrArrRefExp(e)) {
+            indices.push_back(node->get_rhs_operand());
+            e = node->get_lhs_operand();
         }
-        // Append the final rhs (of `top`).
-        indices.push_back(top->get_rhs_operand());
+        std::reverse(indices.begin(), indices.end());
 
         // For arrayVars with `dims.size() < indices.size()` typical arrays...
         // Guard: ranks must match.
@@ -576,9 +590,17 @@ bool KernelCodeGen::generate(SgForStatement* loop,
 
     // --- 5. Classify the kernel-passed variables ---------------------------
     std::set<SgInitializedName*> indexVars;
+    // Indices that are actually materialized in the kernel prologue, i.e. the
+    // collapsed chain.  This has to be kept separate from `indexVars` below,
+    // which additionally holds the indices of non-collapsed inner loops so that
+    // they are kept out of the *parameter* list.  Those inner-loop indices still
+    // need a local declaration emitted in the kernel, because the scope that
+    // declared them is not carried into the kernel text.
+    std::set<SgInitializedName*> collapsedIndexVars;
     for (SgForStatement* L : chain) {
         if (SgInitializedName* iv = SageInterface::getLoopIndexVariable(L)) {
             indexVars.insert(iv);
+            collapsedIndexVars.insert(iv);
         }
     }
     // Include the indices of any loops nested deeper in the body (a
@@ -706,6 +728,12 @@ bool KernelCodeGen::generate(SgForStatement* loop,
         bool upperExclusive = false;  // true when the upper bound is `<`, not `<=`
         std::string indexName;
         std::string typeName;
+        // Loop step, unparsed, defaulting to the literal "1".  This must be
+        // carried through to both the trip count and the index reconstruction;
+        // assuming 1 makes a strided loop visit a contiguous, much larger
+        // range than the source loop did.
+        std::string step = "1";
+        bool unitStep = true;
     };
     std::vector<DimInfo> dims;
     for (SgForStatement* L : chain) {
@@ -715,13 +743,18 @@ bool KernelCodeGen::generate(SgForStatement* loop,
         // collapsed index (the decomposition divides by their trip counts).
         if (L != chain.front() &&
             (exprReferencesAny(c.lowerBound, indexVars) ||
-             exprReferencesAny(c.upperBound, indexVars))) {
+             exprReferencesAny(c.upperBound, indexVars) ||
+             (c.stride && exprReferencesAny(c.stride, indexVars)))) {
             return false;
         }
         DimInfo d;
         d.lower = c.lowerBound->unparseToString();
         d.upper = c.upperBound->unparseToString();
         d.upperExclusive = c.isUpperExclusive;
+        if (c.stride) {
+            d.step = c.stride->unparseToString();
+            d.unitStep = (d.step == "1");
+        }
         d.indexName = c.indexVar ? c.indexVar->get_name().getString() : "";
         d.typeName = c.indexVar ? stripType(c.indexVar->get_type()) : "int";
         if (d.indexName.empty()) return false;
@@ -733,11 +766,27 @@ bool KernelCodeGen::generate(SgForStatement* loop,
     if (!linearizeSubscripts(body, arrayVars)) return false;
 
     // --- 8. Assemble per-dimension trip expressions ------------------------
-    // trip_i = ((upper) - (lower))   (or +1 when inclusive)
+    // trip_i = number of values the induction variable actually takes.
+    //
+    // For a unit step this is the usual span (plus one when the upper bound is
+    // inclusive).  For a step s it is floor((upper-lower)/s)+1, and for an
+    // exclusive upper bound ceil((upper-lower)/s).  The old code always used
+    // the unit-step formula, so `for (j = 1; j <= NY; j += 97)` claimed
+    // NY-1+1 == NY iterations instead of ceil((NY-1)/97), and the kernel then
+    // summed a contiguous slab instead of the strided sample the source loop
+    // took.
     auto tripText = [](const DimInfo& d) {
-        std::string t = "((" + d.upper + ") - (" + d.lower + "))";
-        if (!d.upperExclusive) t += " + 1";
-        return t;
+        if (d.unitStep) {
+            std::string t = "((" + d.upper + ") - (" + d.lower + "))";
+            if (!d.upperExclusive) t += " + 1";
+            return t;
+        }
+        const std::string span = "((" + d.upper + ") - (" + d.lower + "))";
+        if (d.upperExclusive) {
+            // ceil(span / step)
+            return "((" + span + " + (" + d.step + ") - 1) / (" + d.step + "))";
+        }
+        return "((" + span + ") / (" + d.step + ") + 1)";
     };
     std::string totalTrip = tripText(dims[0]);
     for (size_t i = 1; i < dims.size(); ++i) {
@@ -754,6 +803,13 @@ bool KernelCodeGen::generate(SgForStatement* loop,
         if (!bodyText.empty()) bodyText += "\n";
         bodyText += t;
     }
+
+    // Multiply a decomposed linear component by the dimension's step, eliding
+    // the multiply entirely for unit steps.
+    auto stepMul = [](const DimInfo& d, const std::string& component) {
+        if (d.unitStep) return component;
+        return "(" + d.step + ") * (" + component + ")";
+    };
 
     // --- 10. Kernel prologue -------------------------------------------------
     GeneratedKernel gen;
@@ -779,27 +835,33 @@ bool KernelCodeGen::generate(SgForStatement* loop,
     gen.prologue.push_back("if (__loo >= __tot) return;");
 
     // Decompose linear id into the loop indices, innermost first.
+    // index = lower + step * (decomposed component)
     if (dims.size() == 1) {
         const DimInfo& d = dims[0];
-        gen.prologue.push_back(d.typeName + " " + d.indexName +
-                               " = ((" + d.lower + ")) + __loo;");
+        gen.prologue.push_back(d.typeName + " " + d.indexName + " = ((" +
+                               d.lower + ")) + " + stepMul(d, "__loo") + ";");
     } else {
         for (size_t k = dims.size() - 1; k > 0; --k) {
             const DimInfo& d = dims[k];
-            std::string step = "__loo";
             std::string trip = tripText(d);
-            gen.prologue.push_back(d.typeName + " " + d.indexName +
-                                   " = ((" + d.lower + ")) + (__loo % (" +
-                                   trip + ")); __loo /= (" + trip + ");");
+            gen.prologue.push_back(d.typeName + " " + d.indexName + " = ((" +
+                                   d.lower + ")) + " + stepMul(d, "(__loo % (" +
+                                   trip + "))") + "; __loo /= (" + trip + ");");
         }
         const DimInfo& d = dims[0];
-        gen.prologue.push_back(d.typeName + " " + d.indexName +
-                               " = ((" + d.lower + ")) + __loo;");
+        gen.prologue.push_back(d.typeName + " " + d.indexName + " = ((" +
+                               d.lower + ")) + " + stepMul(d, "__loo") + ";");
     }
 
     // Declarations for non-collapsed nested loop induction variables that live
     // in an outer scope (so the kernel body's `for (j ...)` statements resolve).
-    if (dims.size() == 1) {
+    //
+    // This applies for a chain of any depth.  It used to be guarded by
+    // `dims.size() == 1`, which left the inner induction variable undeclared
+    // whenever two or more loops were collapsed -- a 2x2x2 GEMM-style nest
+    // collapsed over i and j kept `for (k ...)` in the kernel body and emitted no
+    // `int k;`, so it failed to compile.
+    {
         for (SgStatement* s : bodyStmts) {
             Rose_STL_Container<SgNode*> loops =
                 NodeQuery::querySubTree(s, V_SgForStatement);
@@ -809,12 +871,23 @@ bool KernelCodeGen::generate(SgForStatement* loop,
                 // Inner loops of the original nest are only a concern when the
                 // outer loop was NOT collapsed.
                 SgInitializedName* iv = SageInterface::getLoopIndexVariable(inner);
-                if (!iv || indexVars.count(iv)) continue;
-                SgScopeStatement* scope = iv->get_scope();
+                // Only the collapsed chain is declared by the prologue above.
+                // Testing `indexVars` here instead would skip exactly these
+                // variables, since they were added to it to stay out of the
+                // parameter list, and the kernel then referenced an undeclared
+                // name ("identifier \"j\" is undefined") for a source loop
+                // like `for (i...) { for (j...) ... }` where the inner loop is
+                // not collapsed.
+                if (!iv || collapsedIndexVars.count(iv)) continue;
+                // Declared inside the body?  The declaration is already part of
+                // the kernel text, so re-declaring it would be a redefinition.
+                // Walk up from the declaration: the variable is local iff the
+                // body encloses it.  (The previous check walked up from the
+                // scope looking for the body, which can never match because the
+                // body is a descendant of the scope, not an ancestor.)
                 bool local = false;
-                for (SgNode* c = scope; c && !isSgFunctionDefinition(c);
-                     c = c->get_parent()) {
-                    if (c == inner || c == body) {
+                for (SgNode* c = iv->get_declaration(); c; c = c->get_parent()) {
+                    if (c == body) {
                         local = true;
                         break;
                     }
@@ -938,25 +1011,36 @@ std::string KernelCodeGen::buildHostStubCUDA(
     std::ostringstream s;
     s << "static void " << gen.hostName << "(" << hostParamsText << ") {\n";
 
-    // Device buffer declarations + allocations + H2D copies.
+    // Device buffer declarations + allocations + H2D copies.  Only ARRAY and
+    // REDUCTION params get a device buffer; SCALAR params are marshalled by
+    // value at the launch site, so declaring (and later cudaFree-ing) a buffer
+    // for them produced dead code that freed a null pointer.
     for (const KernelParam& p : gen.params) {
-        s << "  " << p.typeName << "* __loomx_d_" << p.name << " = 0;\n";
+        if (p.kind == KernelParamKind::ARRAY || p.kind == KernelParamKind::REDUCTION) {
+            s << "  " << p.typeName << "* __loomx_d_" << p.name << " = 0;\n";
+        }
     }
     for (const KernelParam& p : gen.params) {
         std::string d = "__loomx_d_" + p.name;
         if (p.kind == KernelParamKind::ARRAY) {
-            s << "  if (cudaMalloc((void**)&" << d << ", (unsigned long)("
-              << p.sizeExpr << ")) != cudaSuccess) return;\n";
+            s << "  { cudaError_t __e = cudaMalloc((void**)&" << d
+              << ", (unsigned long)(" << p.sizeExpr
+              << ")); if (__e != cudaSuccess) __loomx_cuda_fail(\"cudaMalloc("
+              << d << ")\", __e); }\n";
             if (p.mappedTo) {
-                s << "  if (cudaMemcpy(" << d << ", " << p.name
+                s << "  { cudaError_t __e = cudaMemcpy(" << d << ", " << p.name
                   << ", (unsigned long)(" << p.sizeExpr
-                  << "), cudaMemcpyHostToDevice) != cudaSuccess) return;\n";
+                  << "), cudaMemcpyHostToDevice); if (__e != cudaSuccess)"
+                     " __loomx_cuda_fail(\"H2D " << d << "\", __e); }\n";
             }
         } else if (p.kind == KernelParamKind::REDUCTION) {
-            s << "  if (cudaMalloc((void**)&" << d << ", " << p.sizeExpr
-              << ") != cudaSuccess) return;\n";
-            s << "  if (cudaMemcpy(" << d << ", " << p.name << ", " << p.sizeExpr
-              << ", cudaMemcpyHostToDevice) != cudaSuccess) return;\n";
+            s << "  { cudaError_t __e = cudaMalloc((void**)&" << d << ", "
+              << p.sizeExpr << "); if (__e != cudaSuccess)"
+                 " __loomx_cuda_fail(\"cudaMalloc(" << d << ")\", __e); }\n";
+            s << "  { cudaError_t __e = cudaMemcpy(" << d << ", " << p.name
+              << ", " << p.sizeExpr << ", cudaMemcpyHostToDevice);"
+                 " if (__e != cudaSuccess) __loomx_cuda_fail(\"H2D " << d
+              << "\", __e); }\n";
         }
     }
 
@@ -982,7 +1066,9 @@ std::string KernelCodeGen::buildHostStubCUDA(
         laText += launchArgs[i];
     }
     s << "    " << gen.kernelName << "<<<__grid, __block>>>(" << laText << ");\n";
-    s << "    cudaDeviceSynchronize();\n";
+    s << "    { cudaError_t __e = cudaDeviceSynchronize();"
+         " if (__e != cudaSuccess) __loomx_cuda_fail(\"launch "
+      << gen.kernelName << "\", __e); }\n";
     s << "  }\n";
 
     // D2H copies.
@@ -990,17 +1076,22 @@ std::string KernelCodeGen::buildHostStubCUDA(
         std::string d = "__loomx_d_" + p.name;
         if (p.kind == KernelParamKind::ARRAY) {
             if (p.mappedFrom) {
-                s << "  if (cudaMemcpy(" << p.name << ", " << d
+                s << "  { cudaError_t __e = cudaMemcpy(" << p.name << ", " << d
                   << ", (unsigned long)(" << p.sizeExpr
-                  << "), cudaMemcpyDeviceToHost) != cudaSuccess) return;\n";
+                  << "), cudaMemcpyDeviceToHost); if (__e != cudaSuccess)"
+                     " __loomx_cuda_fail(\"D2H " << d << "\", __e); }\n";
             }
         } else if (p.kind == KernelParamKind::REDUCTION) {
-            s << "  if (cudaMemcpy(" << p.name << ", " << d << ", " << p.sizeExpr
-              << ", cudaMemcpyDeviceToHost) != cudaSuccess) return;\n";
+            s << "  { cudaError_t __e = cudaMemcpy(" << p.name << ", " << d
+              << ", " << p.sizeExpr << ", cudaMemcpyDeviceToHost);"
+                 " if (__e != cudaSuccess) __loomx_cuda_fail(\"D2H " << d
+              << "\", __e); }\n";
         }
     }
     for (const KernelParam& p : gen.params) {
-        s << "  cudaFree(__loomx_d_" << p.name << ");\n";
+        if (p.kind == KernelParamKind::ARRAY || p.kind == KernelParamKind::REDUCTION) {
+            s << "  cudaFree(__loomx_d_" << p.name << ");\n";
+        }
     }
     s << "}\n";
     return s.str();
@@ -1061,7 +1152,24 @@ void KernelCodeGen::finalizeOutput(std::string& source, bool ompUsed) const {
     if (kernels_.empty()) return;
 
     std::string header;
-    if (backend_ == CodeGenBackend::CUDA) header = "#include <cuda_runtime.h>\n";
+    if (backend_ == CodeGenBackend::CUDA) {
+        // Every CUDA API call in a generated host stub is checked, and a failure
+        // aborts loudly.  The previous form was `if (rc != cudaSuccess) return;`
+        // on each site, which silently left every host-side output variable at
+        // its pre-call value: a malloc failure or a bad launch produced a
+        // plausible-looking but wrong answer with exit status 0.  A numerical
+        // mismatch caused that way is indistinguishable from a real codegen
+        // bug, which is worse than a hard failure.
+        header =
+            "#include <cuda_runtime.h>\n"
+            "#include <stdio.h>\n"
+            "#include <stdlib.h>\n"
+            "static void __loomx_cuda_fail(const char* __what, cudaError_t __e) {\n"
+            "  fprintf(stderr, \"loomX: CUDA %s failed: %s\\n\", __what,\n"
+            "          cudaGetErrorString(__e));\n"
+            "  exit(1);\n"
+            "}\n";
+    }
     else if (backend_ == CodeGenBackend::OPENCL) header = "#include <CL/cl.h>\n";
     else return;
     if (ompUsed) header += "#include <omp.h>\n";
