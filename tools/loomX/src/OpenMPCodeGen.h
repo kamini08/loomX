@@ -2,6 +2,7 @@
 #include "CodeGen.h"
 #include "rose.h"
 #include "LoopSummary.h"
+#include "ParallelForPlan.h"
 #include <set>
 #include <string>
 #include <vector>
@@ -36,8 +37,7 @@ private:
     void insertGPUPragma(const loomX::LoopSummary& summary);
     void insertDeclareTargetPragmas(const loomX::LoopSummary& summary);
 
-    std::string buildMapClause(
-        const std::set<std::pair<SgInitializedName*, std::string>>& mapClauses);
+    std::string buildMapClause(const std::vector<loomX::MappedEntry>& entries);
     std::string buildVarList(const std::set<SgInitializedName*>& vars);
     std::string buildReductionClause(
         const std::vector<loomX::ReductionInfo>& reductionDetails);

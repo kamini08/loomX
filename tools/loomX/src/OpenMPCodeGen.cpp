@@ -1,4 +1,5 @@
 #include "OpenMPCodeGen.h"
+#include "ParallelForPlan.h"
 #include "LoopAnalysisUtil.h"
 #include <map>
 #include <set>
@@ -50,6 +51,25 @@ void OpenMPCodeGen::insertGPUPragma(const loomX::LoopSummary& summary) {
     SgForStatement* loop = summary.loop;
     if (!loop) return;
 
+    ParallelForPlan plan(summary);
+
+    // A mapped variable whose extent cannot be established has no correct
+    // `map` spelling: the bare name would transfer a host pointer and the
+    // device would fault on it. Leave the loop to the host rather than emit
+    // that. Verified symptom if this guard is removed: "CUDA error: an illegal
+    // memory access was encountered" from libomptarget.
+    if (!plan.storageIsFullyMapped()) {
+        std::ostringstream reason;
+        reason << "[OpenMPCodeGen] not offloading loop: no derivable extent for "
+               << plan.unmappable().size() << " mapped variable(s): ";
+        for (size_t i = 0; i < plan.unmappable().size(); ++i) {
+            if (i) reason << ", ";
+            reason << plan.unmappable()[i];
+        }
+        std::cerr << reason.str() << " -- leaving loop sequential" << std::endl;
+        return;
+    }
+
     std::ostringstream pragmaText;
     pragmaText << "omp target teams distribute parallel for";
 
@@ -62,15 +82,31 @@ void OpenMPCodeGen::insertGPUPragma(const loomX::LoopSummary& summary) {
     }
 
     if (!summary.privateVars.empty()) {
-        pragmaText << " private(" << buildVarList(summary.privateVars) << ")";
+        pragmaText << " private(" << plan.privateList() << ")";
     }
 
-    if (!summary.reductions.empty()) {
-        pragmaText << " " << buildReductionClause(summary.reductions);
+    std::string reductionText = plan.reductionClause();
+    if (!reductionText.empty()) {
+        pragmaText << " " << reductionText;
     }
 
-    if (!summary.mapClauses.empty()) {
-        pragmaText << " " << buildMapClause(summary.mapClauses);
+    // A `target` construct makes referenced variables firstprivate unless they
+    // are explicitly mapped, and the reduction result is then written back by
+    // the compiler's own handling of the reduction clause. Verified on real
+    // hardware: with clang-15 -fopenmp-targets=nvptx64-nvidia-cuda on sm_86,
+    // the unmapped form already returns the correct sum, so this is NOT a fix
+    // for an observed miscompile.
+    //
+    // It is emitted anyway because correctness here rests on a compiler-
+    // specific interpretation of reduction-on-target rather than on an
+    // explicit data environment, and gcc does not implement that writeback at
+    // all. Stating the mapping makes the requirement visible instead of
+    // implicit, and costs nothing when an enclosing `target data` region
+    // already maps the same variable. buildMapClause merges duplicate names
+    // keeping the strongest direction, so folding them into one set is safe.
+    std::vector<loomX::MappedEntry> entries = plan.entriesIncludingReductions();
+    if (!entries.empty()) {
+        pragmaText << " " << buildMapClause(entries);
     }
 
     SgPragmaDeclaration* pragmaDecl =
@@ -134,55 +170,9 @@ void OpenMPCodeGen::insertDeclareTargetPragmas(const loomX::LoopSummary& summary
     }
 }
 
-// Build a mapped variable reference.
-//
-// - File-scope / static / local arrays: the bare variable name is enough;
-//   the runtime sizes the transfer from the compile-time extent.
-// - Function-parameter arrays: a parameter of type "double A[N][N]" is
-//   really a pointer at the ABI level, so map(A) would transfer only the
-//   pointer (8 bytes) and the device kernel would fault.  These need an
-//   explicit array section.
-//
-// Multi-dimensional arrays must use a per-dimension section
-// "A[0:N][0:M]": clang-15 interprets the length of "A[0:K]" as the number of
-// ROWS, not the flat element count, so a flat section "A[0:(N)*(M)]"
-// allocates N*M*M bytes (cuMemAlloc OOM), and flat sections on static arrays
-// are mis-sized past their object (libomptarget abort "explicit extension not
-// allowed").  Per-dimension sections have an exact size in both cases.
-static std::string buildMappedVarName(SgInitializedName* var) {
-    if (!var) return "";
-
-    std::string name = var->get_name().getString();
-    SgType* type = var->get_type();
-    if (!type) return name;
-
-    type = type->stripType(SgType::STRIP_MODIFIER_TYPE | SgType::STRIP_TYPEDEF_TYPE);
-    SgArrayType* arrType = isSgArrayType(type);
-    if (!arrType) return name;
-
-    bool isParameter = isSgFunctionParameterList(var->get_parent()) != nullptr;
-    if (!isParameter) return name;
-
-    // Emit one [0:<dim>] per array dimension.
-    std::string section;
-    while (arrType) {
-        SgExpression* index = arrType->get_index();
-        if (!index) return name;
-        std::string dim = index->unparseToString();
-        if (dim.empty()) return name;
-        section += "[0:" + dim + "]";
-        SgType* baseType = arrType->get_base_type();
-        if (!baseType) break;
-        baseType = baseType->stripType(SgType::STRIP_MODIFIER_TYPE | SgType::STRIP_TYPEDEF_TYPE);
-        arrType = isSgArrayType(baseType);
-    }
-
-    if (section.empty()) return name;
-    return name + section;
-}
 
 std::string OpenMPCodeGen::buildMapClause(
-    const std::set<std::pair<SgInitializedName*, std::string>>& mapClauses) {
+    const std::vector<loomX::MappedEntry>& entries) {
     // Deduplicate by variable name, keeping the most conservative direction
     // (tofrom > from > to) in case the same name was collected from multiple
     // variable references (e.g. outer-loop scalars also referenced in inner
@@ -193,11 +183,12 @@ std::string OpenMPCodeGen::buildMapClause(
         if (d == "from") return 1;
         return 0;
     };
-    for (const auto& [var, direction] : mapClauses) {
-        std::string name = buildMappedVarName(var);
-        auto it = directionByName.find(name);
-        if (it == directionByName.end() || directionRank(direction) > directionRank(it->second)) {
-            directionByName[name] = direction;
+    for (const loomX::MappedEntry& entry : entries) {
+        if (entry.name.empty()) continue;
+        auto it = directionByName.find(entry.name);
+        if (it == directionByName.end() ||
+            directionRank(entry.direction) > directionRank(it->second)) {
+            directionByName[entry.name] = entry.direction;
         }
     }
 
@@ -225,45 +216,12 @@ std::string OpenMPCodeGen::buildMapClause(
 }
 
 std::string OpenMPCodeGen::buildVarList(const std::set<SgInitializedName*>& vars) {
-    std::ostringstream oss;
-    bool first = true;
-    for (SgInitializedName* var : vars) {
-        if (!first) oss << ", ";
-        first = false;
-        oss << var->get_name().getString();
-    }
-    return oss.str();
+    return ParallelForPlan::renderVarList(vars);
 }
 
 std::string OpenMPCodeGen::buildReductionClause(
     const std::vector<loomX::ReductionInfo>& reductionDetails) {
-    // Group variables by operator string.
-    std::map<std::string, std::vector<std::string>> groups;
-    for (const loomX::ReductionInfo& info : reductionDetails) {
-        if (!info.variable) continue;
-        std::string op = info.opString.empty() ? "+" : info.opString;
-        std::string varName = info.variable->get_name().getString();
-        if (info.isArrayElement && info.arrayIndex) {
-            varName += "[" + info.arrayIndex->unparseToString() + "]";
-        }
-        groups[op].push_back(varName);
-    }
-
-    std::ostringstream oss;
-    bool firstClause = true;
-    for (const auto& [op, vars] : groups) {
-        if (!firstClause) oss << " ";
-        firstClause = false;
-        oss << "reduction(" << op << ":";
-        bool firstVar = true;
-        for (const std::string& varName : vars) {
-            if (!firstVar) oss << ", ";
-            firstVar = false;
-            oss << varName;
-        }
-        oss << ")";
-    }
-    return oss.str();
+    return ParallelForPlan::renderReductionClause(reductionDetails);
 }
 
 // ---------------------------------------------------------------------------
