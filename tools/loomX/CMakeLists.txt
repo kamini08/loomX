@@ -88,6 +88,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         src/InterproceduralAnalysis.cpp
         src/GpuProfitability.cpp
         src/ParallelForPlan.cpp
+        src/LoopFusion.cpp
         src/OpenMPCodeGen.cpp
         src/OpenACCCodeGen.cpp
         src/CudaCodeGen.cpp
@@ -119,6 +120,7 @@ else()
         src/InterproceduralAnalysis.cpp
         src/GpuProfitability.cpp
         src/ParallelForPlan.cpp
+        src/LoopFusion.cpp
         src/OpenMPCodeGen.cpp
         src/OpenACCCodeGen.cpp
         src/CudaCodeGen.cpp

@@ -16,4 +16,13 @@ public:
     virtual void postProcessSource(std::string& source) {
         (void)source;
     }
+
+    // Whether the backend may fuse adjacent offloaded producer/consumer loops
+    // into a single loop. Set from --no-loop-fusion for A/B measurement. Only
+    // the OpenMP backend implements the merge.
+    void setLoopFusionEnabled(bool enabled) { loopFusionEnabled_ = enabled; }
+    bool loopFusionEnabled() const { return loopFusionEnabled_; }
+
+protected:
+    bool loopFusionEnabled_ = true;
 };

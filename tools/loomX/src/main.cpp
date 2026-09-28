@@ -631,6 +631,9 @@ int main(int argc, char* argv[]) {
     bool intraproceduralBaseline = false;
     bool scalarDepCheck = true;
     bool strictRaceSafety = false;
+    // Whether to fuse adjacent offloadable producer/consumer loops.
+    // Default on; --no-loop-fusion turns it off for A/B measurement.
+    bool fuseLoops = true;
     bool phaseCouple = true;
     TranslationMode mode = TranslationMode::GPU_PROFITABLE;
     loomX::CodeGenBackend backend = loomX::CodeGenBackend::OMP;
@@ -653,6 +656,8 @@ int main(int argc, char* argv[]) {
             mode = TranslationMode::CPU_FORCED;
         } else if (arg == "--gpu-naive") {
             mode = TranslationMode::GPU_NAIVE;
+        } else if (arg == "--no-loop-fusion") {
+            fuseLoops = false;
         } else if (arg == "--gpu-profitable") {
             mode = TranslationMode::GPU_PROFITABLE;
         } else if (arg == "--backend" && i + 1 < argc) {
@@ -1088,6 +1093,7 @@ int main(int argc, char* argv[]) {
                     } else {
                         // Backend-specific post-processing (e.g. target-data
                         // hoisting for OpenMP, header injection for OpenACC).
+                        codegen->setLoopFusionEnabled(fuseLoops);
                         codegen->postProcessSource(content);
                     }
 

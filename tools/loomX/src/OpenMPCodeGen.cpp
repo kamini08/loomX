@@ -1,4 +1,5 @@
 #include "OpenMPCodeGen.h"
+#include "LoopFusion.h"
 #include "ParallelForPlan.h"
 #include "LoopAnalysisUtil.h"
 #include <map>
@@ -582,6 +583,12 @@ std::string OpenMPCodeGen::stripTargetAndMap(const std::string& pragmaText) {
 void OpenMPCodeGen::postProcessSource(std::string& source) {
     // Hoist consecutive GPU-offload loops into shared target data regions.
     hoistTargetDataRegions(source);
+
+    // With the map clauses hoisted away, a producer/consumer pair is now two
+    // bare "target teams distribute parallel for" pragmas. Merge those pairs.
+    if (loopFusionEnabled_) {
+        source = loomX::fuseAdjacentOffloadLoops(source);
+    }
 
     // Make sure the OpenMP runtime header is present.
     if (source.find("#include <omp.h>") == std::string::npos &&
