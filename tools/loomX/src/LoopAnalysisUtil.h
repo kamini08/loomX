@@ -63,6 +63,13 @@ inline SgInitializedName* getBaseVariable(SgExpression* expr) {
     return nullptr;
 }
 
+// Return true if type is a pointer or array type (after stripping modifiers/typedefs).
+inline bool isPointerOrArrayType(SgType* type) {
+    if (!type) return false;
+    SgType* base = type->stripType(SgType::STRIP_MODIFIER_TYPE | SgType::STRIP_TYPEDEF_TYPE);
+    return isSgPointerType(base) || isSgArrayType(base);
+}
+
 // Walk up from a reference and look for an enclosing function definition.
 inline SgFunctionDefinition* getEnclosingFunctionDefinition(SgNode* node) {
     while (node) {

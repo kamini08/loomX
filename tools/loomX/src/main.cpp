@@ -11,6 +11,7 @@
 #include "LoopDependenceAnalysis.h"
 #include "PragmaAnalysis.h"
 #include "LoopAnalysisTypes.h"
+#include "ReductionHelperInliner.h"
 #include <iostream>
 #include <vector>
 #include <fstream>
@@ -771,6 +772,11 @@ int main(int argc, char* argv[]) {
         std::cout << "\n";
         ipa.printSummaries();
     }
+
+    // Step 1b: Inline reduction helpers so the reduction detector can see
+    // patterns like "void accum(double x, double* sum) { *sum += x*x; }"
+    // called as "accum(a[i], &sum);" inside a loop.
+    loomX::inlineReductionHelpers(project);
 
     // Step 2: Find all loops
     std::cout << "\n=== Phase 2: Loop Discovery ===\n";

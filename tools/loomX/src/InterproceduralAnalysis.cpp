@@ -1,5 +1,6 @@
 #include "InterproceduralAnalysis.h"
 #include "ComputeIntensityEstimator.h"
+#include "LoopAnalysisUtil.h"
 #include <iostream>
 #include <sstream>
 #include <stack>
@@ -51,16 +52,6 @@ static const std::set<std::string>& getImpureStdlibFunctions() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-static bool isPointerOrArrayType(SgType* type) {
-    if (!type) return false;
-    if (isSgPointerType(type) || isSgArrayType(type)) return true;
-    if (SgReferenceType* ref = isSgReferenceType(type))
-        return isPointerOrArrayType(ref->get_base_type());
-    if (SgTypedefType* td = isSgTypedefType(type))
-        return isPointerOrArrayType(td->get_base_type());
-    return false;
-}
 
 static bool isLhsOfAssignment(SgExpression* expr) {
     if (!expr) return false;
@@ -466,7 +457,7 @@ void InterproceduralAnalysis::analyzeFunction(SgFunctionDeclaration* funcDecl) {
             if (varScope == body) continue;
 
             // Pointer/array parameter dereferences are handled separately.
-            if (paramSet.find(var) != paramSet.end() && isPointerOrArrayType(var->get_type()))
+            if (paramSet.find(var) != paramSet.end() && loomX::isPointerOrArrayType(var->get_type()))
                 continue;
 
             // Anything else (global, file-static, outer scope) counts.
@@ -529,7 +520,7 @@ void InterproceduralAnalysis::collectParameterAccess(SgFunctionDeclaration* func
 
         summary.readParams.insert(idx);
 
-        if (isPointerOrArrayType(var->get_type()) && isDerefRead) {
+        if (loomX::isPointerOrArrayType(var->get_type()) && isDerefRead) {
             summary.pointerReadParams.insert(idx);
         }
     }
@@ -559,7 +550,7 @@ void InterproceduralAnalysis::collectParameterAccess(SgFunctionDeclaration* func
 
         summary.writtenParams.insert(idx);
 
-        if (isPointerOrArrayType(var->get_type()) && isDerefWrite) {
+        if (loomX::isPointerOrArrayType(var->get_type()) && isDerefWrite) {
             summary.pointerWriteParams.insert(idx);
             summary.writesThroughPointer = true;
 
@@ -571,7 +562,7 @@ void InterproceduralAnalysis::collectParameterAccess(SgFunctionDeclaration* func
                 if (SgVarRefExp* idxVarRef = isSgVarRefExp(skipCasts(indexExpr))) {
                     SgInitializedName* idxVar = idxVarRef->get_symbol()->get_declaration();
                     int idxParam = paramIndex(idxVar);
-                    if (idxParam >= 0 && !isPointerOrArrayType(idxVar->get_type())) {
+                    if (idxParam >= 0 && !loomX::isPointerOrArrayType(idxVar->get_type())) {
                         pattern.indexParamIdx = idxParam;
                     }
                 }
@@ -796,7 +787,7 @@ bool InterproceduralAnalysis::isDereferenceWrite(SgNode* ref) const {
 
     SgInitializedName* var = varRef->get_symbol()->get_declaration();
     if (!var) return false;
-    if (!isPointerOrArrayType(var->get_type())) return false;
+    if (!loomX::isPointerOrArrayType(var->get_type())) return false;
 
     // Walk up from the variable reference.  If we encounter a pointer/array
     // dereference node that is the LHS of an assignment, this is a write

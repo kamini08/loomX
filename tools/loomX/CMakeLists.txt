@@ -98,6 +98,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         src/DivergenceAnalyzer.cpp
         src/ComputeIntensityEstimator.cpp
         src/ReductionDetector.cpp
+        src/ReductionHelperInliner.cpp
         src/LoopDependenceAnalysis.cpp
         src/PragmaAnalysis.cpp
         src/KernelCodeGen.cpp
@@ -130,6 +131,7 @@ else()
         src/DivergenceAnalyzer.cpp
         src/ComputeIntensityEstimator.cpp
         src/ReductionDetector.cpp
+        src/ReductionHelperInliner.cpp
         src/LoopDependenceAnalysis.cpp
         src/PragmaAnalysis.cpp
         src/KernelCodeGen.cpp
