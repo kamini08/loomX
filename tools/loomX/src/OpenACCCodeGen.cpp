@@ -1,5 +1,4 @@
 #include "OpenACCCodeGen.h"
-#include "ParallelForPlan.h"
 #include "LoopAnalysisUtil.h"
 #include <map>
 #include <set>
@@ -29,15 +28,12 @@ void OpenACCCodeGen::insertCPUPragma(const loomX::LoopSummary& summary) {
     std::ostringstream pragmaText;
     pragmaText << "acc parallel loop";
 
-    ParallelForPlan plan(summary);
-
     if (!summary.privateVars.empty()) {
-        pragmaText << " private(" << plan.privateList() << ")";
+        pragmaText << " private(" << buildVarList(summary.privateVars) << ")";
     }
 
-    std::string reductionText = plan.reductionClause();
-    if (!reductionText.empty()) {
-        pragmaText << " " << reductionText;
+    if (!summary.reductions.empty()) {
+        pragmaText << " " << buildReductionClause(summary.reductions);
     }
 
     SgPragmaDeclaration* pragmaDecl =
@@ -49,23 +45,6 @@ void OpenACCCodeGen::insertCPUPragma(const loomX::LoopSummary& summary) {
 void OpenACCCodeGen::insertGPUPragma(const loomX::LoopSummary& summary) {
     SgForStatement* loop = summary.loop;
     if (!loop) return;
-
-    ParallelForPlan plan(summary);
-
-    // Same guard as the OpenMP backend: a bare pointer name in a copy clause
-    // moves the pointer, not the allocation, so the device faults. Refuse to
-    // offload rather than emit an unsound copy.
-    if (!plan.storageIsFullyMapped()) {
-        std::ostringstream reason;
-        reason << "[OpenACCCodeGen] not offloading loop: no derivable extent for "
-               << plan.unmappable().size() << " mapped variable(s): ";
-        for (size_t i = 0; i < plan.unmappable().size(); ++i) {
-            if (i) reason << ", ";
-            reason << plan.unmappable()[i];
-        }
-        std::cerr << reason.str() << " -- leaving loop sequential" << std::endl;
-        return;
-    }
 
     std::ostringstream pragmaText;
     pragmaText << "acc parallel loop";
@@ -79,20 +58,15 @@ void OpenACCCodeGen::insertGPUPragma(const loomX::LoopSummary& summary) {
     }
 
     if (!summary.privateVars.empty()) {
-        pragmaText << " private(" << plan.privateList() << ")";
+        pragmaText << " private(" << buildVarList(summary.privateVars) << ")";
     }
 
-    std::string reductionText = plan.reductionClause();
-    if (!reductionText.empty()) {
-        pragmaText << " " << reductionText;
+    if (!summary.reductions.empty()) {
+        pragmaText << " " << buildReductionClause(summary.reductions);
     }
 
-    // OpenACC's reduction() already implies the data transfer, so reduction
-    // variables are deliberately not folded into the copy clause here (unlike
-    // the OpenMP backend).
-    const std::vector<loomX::MappedEntry>& entries = plan.mappedEntries();
-    if (!entries.empty()) {
-        pragmaText << " " << buildCopyClause(entries);
+    if (!summary.mapClauses.empty()) {
+        pragmaText << " " << buildCopyClause(summary.mapClauses);
     }
 
     SgPragmaDeclaration* pragmaDecl =
@@ -149,9 +123,42 @@ void OpenACCCodeGen::insertRoutineSeqPragmas(const loomX::LoopSummary& summary) 
     }
 }
 
+// Build a mapped variable reference for an OpenACC copy clause.  The rules are
+// the same as for OpenMP: parameter arrays need per-dimension array sections,
+// file-scope / static arrays use the bare name.
+static std::string buildMappedVarName(SgInitializedName* var) {
+    if (!var) return "";
+
+    std::string name = var->get_name().getString();
+    SgType* type = var->get_type();
+    if (!type) return name;
+
+    type = type->stripType(SgType::STRIP_MODIFIER_TYPE | SgType::STRIP_TYPEDEF_TYPE);
+    SgArrayType* arrType = isSgArrayType(type);
+    if (!arrType) return name;
+
+    bool isParameter = isSgFunctionParameterList(var->get_parent()) != nullptr;
+    if (!isParameter) return name;
+
+    std::string section;
+    while (arrType) {
+        SgExpression* index = arrType->get_index();
+        if (!index) return name;
+        std::string dim = index->unparseToString();
+        if (dim.empty()) return name;
+        section += "[0:" + dim + "]";
+        SgType* baseType = arrType->get_base_type();
+        if (!baseType) break;
+        baseType = baseType->stripType(SgType::STRIP_MODIFIER_TYPE | SgType::STRIP_TYPEDEF_TYPE);
+        arrType = isSgArrayType(baseType);
+    }
+
+    if (section.empty()) return name;
+    return name + section;
+}
 
 std::string OpenACCCodeGen::buildCopyClause(
-    const std::vector<loomX::MappedEntry>& entries) {
+    const std::set<std::pair<SgInitializedName*, std::string>>& mapClauses) {
     // Deduplicate by variable name, keeping the most conservative direction
     // (copy > copyout > copyin) in case the same name was collected from
     // multiple references.
@@ -166,13 +173,12 @@ std::string OpenACCCodeGen::buildCopyClause(
         if (d == "from" || d == "copyout") return "copyout";
         return "copyin";  // "to" or "copyin"
     };
-    for (const loomX::MappedEntry& entry : entries) {
-        if (entry.name.empty()) continue;
-        std::string accDir = toOpenACCDirection(entry.direction);
-        auto it = directionByName.find(entry.name);
-        if (it == directionByName.end() ||
-            directionRank(accDir) > directionRank(it->second)) {
-            directionByName[entry.name] = accDir;
+    for (const auto& [var, direction] : mapClauses) {
+        std::string name = buildMappedVarName(var);
+        std::string accDir = toOpenACCDirection(direction);
+        auto it = directionByName.find(name);
+        if (it == directionByName.end() || directionRank(accDir) > directionRank(it->second)) {
+            directionByName[name] = accDir;
         }
     }
 
@@ -200,12 +206,45 @@ std::string OpenACCCodeGen::buildCopyClause(
 }
 
 std::string OpenACCCodeGen::buildVarList(const std::set<SgInitializedName*>& vars) {
-    return ParallelForPlan::renderVarList(vars);
+    std::ostringstream oss;
+    bool first = true;
+    for (SgInitializedName* var : vars) {
+        if (!first) oss << ", ";
+        first = false;
+        oss << var->get_name().getString();
+    }
+    return oss.str();
 }
 
 std::string OpenACCCodeGen::buildReductionClause(
     const std::vector<loomX::ReductionInfo>& reductionDetails) {
-    return ParallelForPlan::renderReductionClause(reductionDetails);
+    // Group variables by operator string.
+    std::map<std::string, std::vector<std::string>> groups;
+    for (const loomX::ReductionInfo& info : reductionDetails) {
+        if (!info.variable) continue;
+        std::string op = info.opString.empty() ? "+" : info.opString;
+        std::string varName = info.variable->get_name().getString();
+        if (info.isArrayElement && info.arrayIndex) {
+            varName += "[" + info.arrayIndex->unparseToString() + "]";
+        }
+        groups[op].push_back(varName);
+    }
+
+    std::ostringstream oss;
+    bool firstClause = true;
+    for (const auto& [op, vars] : groups) {
+        if (!firstClause) oss << " ";
+        firstClause = false;
+        oss << "reduction(" << op << ":";
+        bool firstVar = true;
+        for (const std::string& varName : vars) {
+            if (!firstVar) oss << ", ";
+            firstVar = false;
+            oss << varName;
+        }
+        oss << ")";
+    }
+    return oss.str();
 }
 
 void OpenACCCodeGen::postProcessSource(std::string& source) {

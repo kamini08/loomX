@@ -263,7 +263,7 @@ double GpuProfitability::estimateGpuTime(const loomX::LoopSummary& summary) cons
 }
 
 void GpuProfitability::reevaluateTarget(loomX::LoopSummary& summary) {
-    summary.target = decideTarget(summary, "callee-augmented");
+    summary.target = decideTarget(summary);
 }
 
 void GpuProfitability::phaseCoupleInitLoops(
@@ -355,14 +355,12 @@ void GpuProfitability::phaseCoupleInitLoops(
     }
 }
 
-ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary,
-                                              const char* passLabel) {
+ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary) {
     SgForStatement* loop = summary.loop;
 
     // Non-canonical loops cannot be safely parallelized.
     if (summary.canonical.form != loomX::CanonicalForm::CANONICAL) {
-        std::cout << "[GpuProfitability] pass=" << passLabel
-                  << " Loop at line "
+        std::cout << "[GpuProfitability] Loop at line "
                   << loop->get_file_info()->get_line()
                   << " non-canonical (" << summary.canonical.note << ")\n";
         return ParallelTarget::SEQUENTIAL;
@@ -387,8 +385,7 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary,
     double gpuTime = estimateGpuTime(summary);
     double speedup = (gpuTime > 0.0) ? (cpuTime / gpuTime) : 0.0;
 
-    std::cout << "[GpuProfitability] pass=" << passLabel
-              << " Loop at line "
+    std::cout << "[GpuProfitability] Loop at line "
               << loop->get_file_info()->get_line()
               << " iterations=" << iterations
               << " regular=" << regular
@@ -609,7 +606,7 @@ bool GpuProfitability::hasNestedLoops(SgForStatement* loop) {
     return !nested.empty();
 }
 
-bool GpuProfitability::isOutermostLoop(SgForStatement* loop) {
+bool GpuProfitability::isOutermostLoop(SgForStatement* loop) const {
     if (!loop) return false;
     SgNode* parent = loop->get_parent();
     while (parent) {
@@ -617,4 +614,138 @@ bool GpuProfitability::isOutermostLoop(SgForStatement* loop) {
         parent = parent->get_parent();
     }
     return true;
+}
+
+// ========================================================================
+// Horizontal Sub-Batching: Fuse consecutive small GPU loops sharing arrays
+// ========================================================================
+void GpuProfitability::horizontalSubBatch(std::vector<loomX::LoopSummary>& summaries) {
+    if (summaries.size() < 2) return;
+    
+    const size_t n = summaries.size();
+    std::vector<std::set<std::string>> reads(n), writes(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (summaries[i].loop) {
+            collectArrayAccessVars(summaries[i].loop->get_loop_body(),
+                                   reads[i], writes[i]);
+        }
+    }
+
+    auto isNestedInside = [](SgForStatement* inner, SgForStatement* outer) -> bool {
+        if (!inner || !outer) return false;
+        SgNode* parent = inner->get_parent();
+        while (parent) {
+            if (parent == outer) return true;
+            parent = parent->get_parent();
+        }
+        return false;
+    };
+
+    for (size_t i = 0; i < n; ++i) {
+        if (summaries[i].target != loomX::ParallelTarget::GPU_OFFLOAD) continue;
+        long iter = summaries[i].iterationCount;
+        if (iter >= 0 && iter >= 50000) continue;
+        
+        // Look ahead for consecutive loops with overlapping arrays
+        size_t batchEnd = i;
+        std::set<std::string> batchArrays;
+        std::set<std::string> readSet, writeSet;
+        
+        // Initialize with first loop's arrays
+        for (const auto& r : reads[i]) readSet.insert(r);
+        for (const auto& w : writes[i]) writeSet.insert(w);
+        
+        long totalIters = summaries[i].iterationCount >= 0 ? summaries[i].iterationCount : 0;
+        
+        for (size_t j = i + 1; j < n; ++j) {
+            if (summaries[j].target != loomX::ParallelTarget::GPU_OFFLOAD) break;
+            long iterJ = summaries[j].iterationCount;
+            if (iterJ >= 0 && iterJ >= 50000) break;
+            
+            // Check array overlap
+            bool overlap = false;
+            for (const auto& r : reads[j]) if (writeSet.count(r)) { overlap = true; break; }
+            for (const auto& w : writes[j]) if (readSet.count(w) || writeSet.count(w)) { overlap = true; break; }
+            if (!overlap) break;
+            
+            // Merge arrays
+            for (const auto& r : reads[j]) readSet.insert(r);
+            for (const auto& w : writes[j]) writeSet.insert(w);
+            totalIters += (summaries[j].iterationCount >= 0 ? summaries[j].iterationCount : 0);
+            
+            // Check if bounds are compatible for potential collapse
+            if (!summaries[i].canonical.sameBounds(summaries[j].canonical)) {
+                // Different bounds - note but continue
+            }
+            
+            batchEnd = j;
+        }
+        
+        if (batchEnd > i) {
+            // Mark for batched execution
+            for (size_t k = i; k <= batchEnd; ++k) {
+                summaries[k].batched = true;
+                summaries[k].batchLeader = i;
+                summaries[k].batchEnd = batchEnd;
+            }
+            i = batchEnd;  // Skip processed loops
+        }
+    }
+}
+
+// ========================================================================
+// Pipeline Phase Coupling: Producer → Consumer → Reducer chains
+// ========================================================================
+void GpuProfitability::pipelinePhaseCouple(std::vector<loomX::LoopSummary>& summaries) {
+    if (summaries.size() < 2) return;
+    
+    const size_t n = summaries.size();
+    std::vector<std::set<std::string>> reads(n), writes(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (summaries[i].loop) {
+            collectArrayAccessVars(summaries[i].loop->get_loop_body(),
+                                   reads[i], writes[i]);
+        }
+    }
+    
+    // Find pipeline chains: Producer → Consumer → Reducer
+    std::vector<bool> used(n, false);
+    
+    for (size_t i = 0; i < n; ++i) {
+        if (used[i] || summaries[i].target != loomX::ParallelTarget::GPU_OFFLOAD) continue;
+        
+        std::vector<size_t> pipeline;
+        pipeline.push_back(i);
+        used[i] = true;
+        
+        // Look for consecutive stages
+        for (size_t j = i + 1; j < n; ++j) {
+            if (summaries[j].target != loomX::ParallelTarget::GPU_OFFLOAD) break;
+            if (used[j]) continue;
+            
+            // Check if j consumes what j-1 produces
+            bool consumes = false;
+            for (const auto& w : writes[j-1]) {
+                if (reads[j].count(w)) { consumes = true; break; }
+            }
+            // Or if it's a reducer
+            bool isReducer = !summaries[j].reductions.empty();
+            
+            if (consumes || isReducer) {
+                pipeline.push_back(j);
+                used[j] = true;
+            } else {
+                break;
+            }
+        }
+        
+        if (pipeline.size() >= 2) {
+            // Mark pipeline stages
+            for (size_t k = 0; k < pipeline.size(); ++k) {
+                summaries[pipeline[k]].pipelineStage = k;
+                summaries[pipeline[k]].pipelineLeader = pipeline[0];
+                summaries[pipeline[k]].pipelineLength = pipeline.size();
+            }
+        }
+    }
 }

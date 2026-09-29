@@ -2,7 +2,6 @@
 #include "CodeGen.h"
 #include "rose.h"
 #include "LoopSummary.h"
-#include "ParallelForPlan.h"
 #include <set>
 #include <string>
 #include <vector>
@@ -17,16 +16,11 @@ public:
     // For CPU_OPENMP this includes:
     //   - #pragma omp parallel for before the loop
     // For SEQUENTIAL this does nothing.
-    void generatePragmas(const loomX::LoopSummary& summary) override;
+    void generatePragmas(const loomX::LoopSummary& summary);
 
-    // Insert only the CPU `#pragma omp parallel for` (plus private/reduction
-    // clauses).  Used by the CUDA/OpenCL backends as a fallback for loops that
-    // cannot be expressed as device kernels.
-    void generateCPUPragma(const loomX::LoopSummary& summary);
-
-    // Text-based post-processing of the unparsed source: hoist consecutive
-    // GPU-offload loops into a single #pragma omp target data region and
-    // prepend #include <omp.h> if it is missing.
+    // Text-based post-processing: rewrite the unparsed source so that
+    // consecutive GPU-offload loops are wrapped in a single
+    // #pragma omp target data region, and prepend #include <omp.h> if missing.
     void postProcessSource(std::string& source) override;
 
     // Helper used by postProcessSource.
@@ -37,7 +31,8 @@ private:
     void insertGPUPragma(const loomX::LoopSummary& summary);
     void insertDeclareTargetPragmas(const loomX::LoopSummary& summary);
 
-    std::string buildMapClause(const std::vector<loomX::MappedEntry>& entries);
+    std::string buildMapClause(
+        const std::set<std::pair<SgInitializedName*, std::string>>& mapClauses);
     std::string buildVarList(const std::set<SgInitializedName*>& vars);
     std::string buildReductionClause(
         const std::vector<loomX::ReductionInfo>& reductionDetails);

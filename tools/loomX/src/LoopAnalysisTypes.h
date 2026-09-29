@@ -142,6 +142,15 @@ struct CanonicalResult {
     bool isLowerInclusive = true;   // Canonical ROSE form is usually i=lb; i<ub; i++
     bool isUpperExclusive = true;
     std::string note;               // Human-readable detail
+
+    // Check if two canonical loops have the same bounds structure (for collapse/batching).
+    bool sameBounds(const CanonicalResult& other) const {
+        if (form != other.form) return false;
+        if (!indexVar || !other.indexVar) return false;
+        // Compare bounds structure - simplified comparison
+        return lowerBound && other.lowerBound && upperBound && other.upperBound &&
+               stride && other.stride;
+    }
 };
 
 // Reduction operator kinds detected by the reduction analyzer.

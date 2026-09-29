@@ -1034,6 +1034,30 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Horizontal sub-batching: fuse consecutive small GPU loops sharing arrays
+    // into a single kernel launch to amortize launch overhead.
+    if (mode == TranslationMode::GPU_PROFITABLE && !accepted.empty()) {
+        std::vector<loomX::LoopSummary> summaries;
+        summaries.reserve(accepted.size());
+        for (const auto& entry : accepted) summaries.push_back(entry.first);
+        profitability.horizontalSubBatch(summaries);
+        for (size_t i = 0; i < accepted.size(); ++i) {
+            accepted[i].first = summaries[i];
+        }
+    }
+
+    // Pipeline phase coupling: detect producer→consumer→reducer chains
+    // and mark them for single target-data region wrapping.
+    if (mode == TranslationMode::GPU_PROFITABLE && !accepted.empty()) {
+        std::vector<loomX::LoopSummary> summaries;
+        summaries.reserve(accepted.size());
+        for (const auto& entry : accepted) summaries.push_back(entry.first);
+        profitability.pipelinePhaseCouple(summaries);
+        for (size_t i = 0; i < accepted.size(); ++i) {
+            accepted[i].first = summaries[i];
+        }
+    }
+
     for (auto& entry : accepted) {
             loomX::LoopSummary& summary = entry.first;
             bool coupleOnly = entry.second;
