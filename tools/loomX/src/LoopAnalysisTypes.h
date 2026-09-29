@@ -1,6 +1,8 @@
 #pragma once
 #include "rose.h"
 #include <string>
+#include <map>
+#include <climits>
 
 namespace loomX {
 
@@ -214,6 +216,55 @@ struct ComputeIntensityResult {
     long long integerOpCount = 0;    // Static estimate of integer operations
     bool hasHeavyMath = false;       // sin/cos/sqrt/exp/log/etc.
     std::string note;
+};
+
+// Loop archetype classification (inspired by H-ROCKS operation classification).
+// Classifies loops by semantic pattern rather than just raw FLOPs.
+// This allows per-archetype profitability thresholds and codegen hints.
+
+enum class LoopArchetype {
+    UNKNOWN,
+    DENSE_GEMM,           // C[i][j] += A[i][k]*B[k][j] (3-deep nest, k inner)
+    DENSE_SYRK,           // C[i][j] += A[i][k]*A[j][k] (symmetric)
+    STENCIL_1D,           // A[i] = f(A[i-1], A[i], A[i+1])
+    STENCIL_2D,           // A[i][j] = f(neighbors) (5-point, 9-point)
+    STENCIL_3D,           // A[i][j][k] = f(neighbors) (7-point, 27-point)
+    REDUCTION_SUM,        // sum += A[i] (or += A[i]*B[i])
+    REDUCTION_MAXMIN,     // max = max(max, A[i])
+    SPARSE_SPMV,          // y[i] = sum_j A[i][j]*x[j] (indirect access)
+    GRAPH_TRAVERSAL,      // while/queue-based: BFS, PageRank
+    MEMORY_COPY,          // B[i] = A[i]
+    MEMORY_SCALE,         // B[i] = alpha*A[i]
+    TRANSCENDENTAL_HEAVY, // sin/cos/exp/log/sqrt dominate
+    COMPUTE_HEAVY,        // High FLOP count without transcendental functions
+    CONTROL_FLOW_HEAVY    // if/else chains, data-dependent branches
+};
+
+struct ArchetypeProfile {
+    double min_speedup_threshold;   // Override global minGpuSpeedup
+    bool prefers_gpu;               // Default target bias
+    bool needs_halo_exchange;       // Stencils need boundary sync
+    bool supports_collapse;         // Can collapse nested loops
+    int  min_iterations_for_gpu;    // Below this, never GPU
+    long long min_total_flop_for_gpu; // Override global minTotalFlopForGPU
+    bool is_memory_bound_by_nature; // Always memory-bound regardless of FLOPs
+};
+
+static const std::map<LoopArchetype, ArchetypeProfile> ARCHETYPE_PROFILES = {
+    {LoopArchetype::DENSE_GEMM,       {1.10, true,  false, true,  1000,  1000000,  false}},
+    {LoopArchetype::DENSE_SYRK,       {1.10, true,  false, true,  1000,  1000000,  false}},
+    {LoopArchetype::STENCIL_1D,       {1.15, true,  true,  false, 5000,  1000000,  false}},
+    {LoopArchetype::STENCIL_2D,       {1.20, true,  true,  true,  1000,  1000000,  false}},
+    {LoopArchetype::STENCIL_3D,       {1.25, true,  true,  true,  500,   1000000,  false}},
+    {LoopArchetype::REDUCTION_SUM,    {1.10, true,  false, false, 10000, 1000000,  false}},
+    {LoopArchetype::REDUCTION_MAXMIN, {1.10, true,  false, false, 10000, 1000000,  false}},
+    {LoopArchetype::SPARSE_SPMV,      {2.00, false, false, false, 50000, 5000000,  true}},
+    {LoopArchetype::GRAPH_TRAVERSAL,  {3.00, false, false, false, 100000, 10000000, true}},
+    {LoopArchetype::MEMORY_COPY,      {10.0, false, false, false, INT_MAX, INT_MAX,  true}},
+    {LoopArchetype::MEMORY_SCALE,     {5.00, false, false, false, INT_MAX, INT_MAX,  true}},
+    {LoopArchetype::TRANSCENDENTAL_HEAVY,{1.05,true, false, false, 1000,  1000000,  false}},
+    {LoopArchetype::COMPUTE_HEAVY,      {1.10,true,  false, false, 1000,  1000000,  false}},
+    {LoopArchetype::CONTROL_FLOW_HEAVY,{3.00, false, false, false, 50000, 10000000, true}},
 };
 
 } // namespace loomX
