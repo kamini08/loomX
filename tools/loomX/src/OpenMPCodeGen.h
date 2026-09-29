@@ -2,6 +2,7 @@
 #include "CodeGen.h"
 #include "rose.h"
 #include "LoopSummary.h"
+#include "ParallelForPlan.h"
 #include <set>
 #include <string>
 #include <vector>
@@ -18,6 +19,9 @@ public:
     // For SEQUENTIAL this does nothing.
     void generatePragmas(const loomX::LoopSummary& summary);
 
+    // Overload for CPU-only pragma generation (used when GPU kernelization fails).
+    void generateCPUPragma(const loomX::LoopSummary& summary);
+
     // Text-based post-processing: rewrite the unparsed source so that
     // consecutive GPU-offload loops are wrapped in a single
     // #pragma omp target data region, and prepend #include <omp.h> if missing.
@@ -32,7 +36,7 @@ private:
     void insertDeclareTargetPragmas(const loomX::LoopSummary& summary);
 
     std::string buildMapClause(
-        const std::set<std::pair<SgInitializedName*, std::string>>& mapClauses);
+        const std::vector<loomX::MappedEntry>& entries);
     std::string buildVarList(const std::set<SgInitializedName*>& vars);
     std::string buildReductionClause(
         const std::vector<loomX::ReductionInfo>& reductionDetails);
