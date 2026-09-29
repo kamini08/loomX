@@ -825,6 +825,13 @@ int main(int argc, char* argv[]) {
         }
         bool initHelperLoop = (funcName == "init_array");
 
+        // Loops inside helper functions that are called from host code should
+        // not become separate GPU kernels: one kernel launch per call is
+        // catastrophic for helpers called inside a host loop (e.g. local_array's
+        // convolve_local).  init_array helpers are exempt because phase-coupling
+        // may legitimately promote them into a consuming GPU kernel.
+        bool helperNoOffload = (!funcName.empty() && funcName != "main" && !initHelperLoop);
+
         // Skip loops nested inside already-parallelized loops
         bool nested = false;
         SgNode* parent = loop->get_parent();
@@ -903,6 +910,13 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        // Helper-function loops must not become standalone GPU kernels.
+        if (helperNoOffload && summary.target == ParallelTarget::GPU_OFFLOAD) {
+            std::cout << "  -> helper-function loop kept sequential: "
+                      << funcName << "\n";
+            summary.target = ParallelTarget::SEQUENTIAL;
+        }
+
         // Apply translation-mode override for ablation experiments.  init_array
         // helper loops are excluded: phase-coupling is a profitable-pipeline
         // concept, so the ablation modes keep their previous (untouched)
@@ -930,7 +944,12 @@ int main(int argc, char* argv[]) {
                 // loop that passed the safety checks is offloaded, including
                 // ones the cost model marked SEQUENTIAL (e.g. below the
                 // CPU-OpenMP FLOP threshold).
-                summary.target = ParallelTarget::GPU_OFFLOAD;
+                if (helperNoOffload) {
+                    std::cout << "  -> helper-function loop kept sequential: "
+                              << funcName << "\n";
+                } else {
+                    summary.target = ParallelTarget::GPU_OFFLOAD;
+                }
             }
         }
 
