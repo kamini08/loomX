@@ -3,8 +3,10 @@
 #include "ParallelForPlan.h"
 #include "LoopAnalysisUtil.h"
 #include <map>
+#include <regex>
 #include <set>
 #include <sstream>
+#include <vector>
 
 using namespace loomX;
 
@@ -350,6 +352,44 @@ static size_t skipBlankAndComments(const std::string& source, size_t pos) {
     return source.size();
 }
 
+// True if line looks like a scalar variable declaration that can safely be
+// moved across a target region boundary.  Conservative: allow a type-name
+// sequence followed by an identifier and optional literal/simple initializer.
+static bool isMovableDeclarationLine(const std::string& line) {
+    static const std::regex declRe(
+        R"(^\s*(?:const\s+|volatile\s+)*(?:\w+\s+)+(?:\*\s*)*\w+(?:\s*=\s*[^;]+)?\s*;\s*$)");
+    return std::regex_match(line, declRe);
+}
+
+// Like skipBlankAndComments, but also skips single-line variable declarations.
+// Any skipped declarations are appended to `movedDecls` so the caller can emit
+// them before the construct they precede.
+static size_t skipBlankCommentsAndDeclarations(const std::string& source, size_t pos,
+                                                std::string& movedDecls) {
+    while (pos < source.size()) {
+        size_t next = source.find_first_not_of(" \t\n", pos);
+        if (next == std::string::npos) return source.size();
+        if (source.compare(next, 2, "//") == 0) {
+            size_t eol = source.find('\n', next);
+            pos = (eol == std::string::npos) ? source.size() : eol + 1;
+            continue;
+        }
+        // Check whether the current line is a movable declaration.
+        size_t eol = source.find('\n', next);
+        std::string line = (eol == std::string::npos)
+                               ? source.substr(next)
+                               : source.substr(next, eol - next + 1);
+        if (isMovableDeclarationLine(line)) {
+            movedDecls += line;
+            if (eol == std::string::npos) return source.size();
+            pos = eol + 1;
+            continue;
+        }
+        return next;
+    }
+    return source.size();
+}
+
 void OpenMPCodeGen::hoistTargetDataRegions(std::string& source) {
     const std::string targetPrefix = "#pragma omp target teams distribute parallel for";
 
@@ -370,16 +410,19 @@ void OpenMPCodeGen::hoistTargetDataRegions(std::string& source) {
         }
 
         // Found a GPU target pragma. Try to gather a run of consecutive
-        // target-loop pairs, ignoring blank lines and // comments between them.
+        // target-loop pairs, ignoring blank lines, // comments, and local
+        // variable declarations between them.  The declarations are moved in
+        // front of the coalesced target-data region.
         std::vector<std::pair<size_t, size_t>> pairs;
+        std::string movedDecls;
         size_t scan = lineStart;
         while (scan < source.size()) {
-            size_t pragmaStart = skipBlankAndComments(source, scan);
+            size_t pragmaStart = skipBlankCommentsAndDeclarations(source, scan, movedDecls);
             if (pragmaStart == source.size()) break;
             if (source.compare(pragmaStart, targetPrefix.size(), targetPrefix) != 0) break;
 
             size_t pragmaEnd = findPragmaEnd(source, pragmaStart);
-            size_t afterPragma = skipBlankAndComments(source, pragmaEnd + 1);
+            size_t afterPragma = skipBlankCommentsAndDeclarations(source, pragmaEnd + 1, movedDecls);
             if (afterPragma == source.size()) break;
             if (!lineStartsForLoop(source.substr(afterPragma, 10))) break;
 
@@ -389,7 +432,8 @@ void OpenMPCodeGen::hoistTargetDataRegions(std::string& source) {
         }
 
         if (pairs.size() < 2) {
-            // Single GPU loop: leave as-is.
+            // Single GPU loop: leave as-is (including any declarations we
+            // skipped, since they cannot be hoisted across a singleton).
             size_t end = pairs.empty() ? lineStart + targetPrefix.size()
                                        : pairs.back().second;
             result.append(source, pos, end - pos);
@@ -430,6 +474,12 @@ void OpenMPCodeGen::hoistTargetDataRegions(std::string& source) {
             result.append(source, pos, end - pos);
             pos = end;
             continue;
+        }
+
+        // Emit any declarations that were between the gathered loops.
+        if (!movedDecls.empty()) {
+            result += movedDecls;
+            if (movedDecls.back() != '\n') result += "\n";
         }
 
         // Emit target data pragma.
