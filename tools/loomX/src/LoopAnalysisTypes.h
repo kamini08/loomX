@@ -42,19 +42,20 @@ struct ProfitabilityConfig {
     // FLOPs per memory-op threshold used by the compute-intensity estimator.
     double computeBoundThreshold = 16.0;
 
-    // Hardware throughput numbers estimated for the actual target GPU: an
-    // NVIDIA GeForce RTX 4050 Laptop (compute capability 8.9, 6 GB GDDR6).
-    //   - FP32 peak      ~12 TFLOPS (2560 CUDA cores @ ~2.37 GHz)
-    //   - device memory  ~192 GB/s (96-bit GDDR6 @ 16 Gbps)
-    //   - PCIe Gen4 x8 max, negotiated x4 on this laptop (~8 GB/s/direction)
+    // Hardware throughput numbers measured / looked up for the actual target
+    // GPU: an NVIDIA GeForce RTX 5060 Laptop (Blackwell, compute capability
+    // 12.0, 8 GB GDDR6).
+    //   - FP32 peak      ~14-15 TFLOPS (3328 CUDA cores @ ~2.2 GHz, dual-issue)
+    //   - device memory  ~384 GB/s (128-bit GDDR6 @ ~12 Gbps)
+    //   - PCIe Gen4 x8   ~14 GB/s/direction (realistic, theoretical 16 GB/s)
     //   - libomptarget offload launch overhead ~10 us, PCIe latency ~5 us
     // `gpuComputeThroughput` is the raw peak; the model multiplies it by
     // `gpuComputeEfficiency` to approximate real kernel throughput.
     double cpuComputeThroughput = 5.0;     // GFLOP/s per core (scalar, single-thread)
-    double gpuComputeThroughput = 12000.0; // GFLOP/s (FP32 peak)
+    double gpuComputeThroughput = 15000.0; // GFLOP/s (FP32 peak)
     double cpuMemoryBandwidth = 20.0;      // GB/s (per socket, shared)
-    double gpuMemoryBandwidth = 192.0;     // GB/s (RTX 4050 Laptop)
-    double pcieBandwidth = 8.0;            // GB/s (PCIe Gen4 x4 negotiated)
+    double gpuMemoryBandwidth = 384.0;     // GB/s (RTX 5060 Laptop, measured)
+    double pcieBandwidth = 14.0;           // GB/s (PCIe Gen4 x8)
     double pcieLatency = 5.0;              // microseconds per transfer direction
     double kernelLaunchOverhead = 10.0;    // microseconds
 
@@ -70,10 +71,9 @@ struct ProfitabilityConfig {
 
     // GPU hardware sizing for utilization penalty.  A loop with too few
     // iterations cannot fill the device, so effective compute throughput is
-    // reduced.  These defaults describe a mid-sized NVIDIA GPU; override for
-    // the actual target hardware.
-    int gpuSMCount = 80;
-    int gpuWarpsPerSM = 16;
+    // reduced.  These defaults describe the actual target hardware.
+    int gpuSMCount = 26;
+    int gpuWarpsPerSM = 48;
     int gpuThreadsPerWarp = 32;
 
     // Fraction of peak FP throughput a typical kernel actually achieves

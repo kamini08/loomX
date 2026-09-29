@@ -72,6 +72,11 @@ void ComputeIntensityEstimator::countOperations(SgStatement* body,
                                                  bool& heavyMath) {
     if (!body) return;
 
+    // Cap tripCount to avoid overflow when nested loops have very large
+    // iteration counts (e.g. 100k^4 exceeds int64_t range).
+    const long long MAX_TRIP = 1000000000000LL; // 1e12
+    if (tripCount < 0 || tripCount > MAX_TRIP) tripCount = MAX_TRIP;
+
     // Memory operations: array references and pointer dereferences.
     // Skip those that are inside a nested loop; those are handled recursively.
     // Memory operations: array references and pointer dereferences.
