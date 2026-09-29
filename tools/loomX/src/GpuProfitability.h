@@ -34,6 +34,14 @@ public:
     // must be in program order.
     void phaseCoupleInitLoops(std::vector<loomX::LoopSummary>& summaries);
 
+    // Promote sequential loops that sit between two GPU loops in the same
+    // function to GPU_OFFLOAD, avoiding target-data teardown / restart overhead.
+    void bridgeSequentialLoops(std::vector<std::pair<loomX::LoopSummary, bool>>& accepted) const;
+
+    // True if the loop is safe for GPU offload (canonical, regular, not strongly
+    // divergent), regardless of profitability.
+    bool isGpuSafe(const loomX::LoopSummary& summary) const;
+
     // Compute the perfect-nest depth for a "collapse(N)" clause on a
     // GPU-offloaded loop.  Returns >= 2 when the loop heads a perfect nest of
     // inner loops that are all canonical AND carry no loop-carried dependence
@@ -89,5 +97,5 @@ private:
     // True if this for-loop is not nested inside another for-loop in the AST.
     // CPU OpenMP is generally a poor choice for inner loops of a sequential nest
     // because of repeated parallel-region creation overhead.
-    bool isOutermostLoop(SgForStatement* loop);
+    bool isOutermostLoop(SgForStatement* loop) const;
 };
