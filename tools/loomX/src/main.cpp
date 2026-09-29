@@ -12,6 +12,7 @@
 #include "PragmaAnalysis.h"
 #include "LoopAnalysisTypes.h"
 #include "ReductionHelperInliner.h"
+#include "FunctionPointerDevirtualizer.h"
 #include <iostream>
 #include <vector>
 #include <fstream>
@@ -777,6 +778,11 @@ int main(int argc, char* argv[]) {
     // patterns like "void accum(double x, double* sum) { *sum += x*x; }"
     // called as "accum(a[i], &sum);" inside a loop.
     loomX::inlineReductionHelpers(project);
+
+    // Step 1c: Devirtualize loop-invariant function pointers so that loops
+    // like "op = cond ? scale : offset; for (...) b[i] = op(a[i]);" become
+    // direct conditional calls that the offload analysis can handle.
+    loomX::devirtualizeFunctionPointers(project);
 
     // Step 2: Find all loops
     std::cout << "\n=== Phase 2: Loop Discovery ===\n";

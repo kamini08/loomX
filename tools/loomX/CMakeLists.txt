@@ -99,6 +99,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         src/ComputeIntensityEstimator.cpp
         src/ReductionDetector.cpp
         src/ReductionHelperInliner.cpp
+        src/FunctionPointerDevirtualizer.cpp
         src/LoopDependenceAnalysis.cpp
         src/PragmaAnalysis.cpp
         src/KernelCodeGen.cpp

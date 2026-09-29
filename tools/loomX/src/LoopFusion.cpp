@@ -274,9 +274,427 @@ bool producerWritesAtIndexOnly(const std::string& s, const LoopRec& prod) {
     return true;
 }
 
+// True if expr contains an assignment, increment/decrement, or other
+// construct that is unsafe to duplicate.  Function calls are allowed: the
+// producer expression is already evaluated once per iteration, and duplicating
+// a pure helper call into the consumer is exactly what enables call_chain and
+// friends to collapse to the hand-written ideal.
+bool hasSideEffects(const std::string& expr) {
+    for (size_t i = 0; i < expr.size(); ++i) {
+        if (i + 1 < expr.size() && expr[i] == '+' && expr[i + 1] == '+') return true;
+        if (i + 1 < expr.size() && expr[i] == '-' && expr[i + 1] == '-') return true;
+        if (expr[i] == '=') {
+            // == is comparison; everything else containing '=' is an assignment
+            // or compound assignment and is unsafe to duplicate.
+            bool comparison = (i > 0 && expr[i - 1] == '=') ||
+                              (i + 1 < expr.size() && expr[i + 1] == '=');
+            if (!comparison) return true;
+        }
+    }
+    return false;
+}
+
+// Find the last simple assignment "arr[iv] = expr;" in producerInner and
+// return its RHS expression.  Returns empty if not found.  Also appends the
+// positions of all such assignments to assignmentsOut so they can be removed.
+std::string findLastIndexAssignmentRhs(const std::string& producerInner,
+                                       const std::string& arr,
+                                       const std::string& iv,
+                                       std::vector<size_t>& assignmentsOut) {
+    std::string needle = arr + "[" + iv + "]";
+    std::string result;
+    size_t pos = 0;
+    while ((pos = producerInner.find(needle, pos)) != std::string::npos) {
+        size_t after = pos + needle.size();
+        while (after < producerInner.size() &&
+               std::isspace(static_cast<unsigned char>(producerInner[after]))) ++after;
+        if (after >= producerInner.size() || producerInner[after] != '=') { ++pos; continue; }
+        if (after + 1 < producerInner.size() && producerInner[after + 1] == '=') { ++pos; continue; }
+        size_t stmtEnd = producerInner.find(';', after);
+        if (stmtEnd == std::string::npos) { ++pos; continue; }
+        std::string expr = producerInner.substr(after + 1, stmtEnd - (after + 1));
+        size_t e = 0;
+        while (e < expr.size() && std::isspace(static_cast<unsigned char>(expr[e]))) ++e;
+        size_t r = expr.size();
+        while (r > e && std::isspace(static_cast<unsigned char>(expr[r - 1]))) --r;
+        expr = expr.substr(e, r - e);
+        assignmentsOut.push_back(pos);
+        result = expr;
+        pos = stmtEnd + 1;
+    }
+    return result;
+}
+
+// True if consumerInner writes arr[iv] before reading it.  Conservative: any
+// write at the same index counts.
+bool consumerOverwritesArray(const std::string& consumerInner,
+                             const std::string& arr,
+                             const std::string& iv) {
+    std::string needle = arr + "[" + iv + "]";
+    size_t pos = 0;
+    while ((pos = consumerInner.find(needle, pos)) != std::string::npos) {
+        size_t after = pos + needle.size();
+        while (after < consumerInner.size() &&
+               std::isspace(static_cast<unsigned char>(consumerInner[after]))) ++after;
+        if (after < consumerInner.size() && consumerInner[after] == '=' &&
+            (after + 1 >= consumerInner.size() || consumerInner[after + 1] != '=')) {
+            return true;
+        }
+        ++pos;
+    }
+    return false;
+}
+
+// Replace every occurrence of arr[iv] in text with "(expr)".
+std::string substituteArrayRead(const std::string& text,
+                                const std::string& arr,
+                                const std::string& iv,
+                                const std::string& expr) {
+    std::string needle = arr + "[" + iv + "]";
+    std::string replacement = "(" + expr + ")";
+    std::string out = text;
+    size_t pos = 0;
+    while ((pos = out.find(needle, pos)) != std::string::npos) {
+        out.replace(pos, needle.size(), replacement);
+        pos += replacement.size();
+    }
+    return out;
+}
+
+// Try to scalar-replace produced arrays that are only read at the same index.
+// For each arr[iv] = expr in the producer, if expr is side-effect-free and the
+// consumer only reads arr[iv] (does not overwrite it), replace the reads in the
+// consumer with (expr) and drop the producer assignment.
+// Returns true if any contraction happened.
+bool contractProducerArrays(const std::string& producerInner,
+                            const std::string& consumerInner,
+                            const std::string& iv,
+                            const std::set<std::string>& producedArrays,
+                            std::string& newProducerInner,
+                            std::string& newConsumerInner) {
+    newProducerInner = producerInner;
+    newConsumerInner = consumerInner;
+    bool changed = false;
+
+    for (const std::string& arr : producedArrays) {
+        std::vector<size_t> assigns;
+        std::string expr = findLastIndexAssignmentRhs(newProducerInner, arr, iv, assigns);
+        if (expr.empty() || hasSideEffects(expr)) continue;
+        if (consumerOverwritesArray(newConsumerInner, arr, iv)) continue;
+
+        // If the assignments to this array are guarded by differing control
+        // flow (e.g. one in an if branch and one in an else branch), the final
+        // value is not a single expression and contraction is unsafe.
+        if (assigns.size() > 1) {
+            size_t first = assigns.front();
+            size_t last = assigns.back();
+            if (last > first) {
+                std::string between = newProducerInner.substr(first, last - first);
+                if (between.find("if") != std::string::npos ||
+                    between.find("else") != std::string::npos) {
+                    continue;
+                }
+            }
+        }
+
+        // Substitute in consumer.
+        newConsumerInner = substituteArrayRead(newConsumerInner, arr, iv, expr);
+
+        // Remove all producer assignment statements to this array.
+        std::string needle = arr + "[" + iv + "]";
+        for (auto it = assigns.rbegin(); it != assigns.rend(); ++it) {
+            size_t pos = *it;
+            size_t stmtStart = pos;
+            while (stmtStart > 0 && newProducerInner[stmtStart - 1] != ';' &&
+                   newProducerInner[stmtStart - 1] != '\n' &&
+                   newProducerInner[stmtStart - 1] != '{') --stmtStart;
+            size_t stmtEnd = newProducerInner.find(';', pos);
+            if (stmtEnd != std::string::npos) {
+                size_t removeEnd = stmtEnd + 1;
+                while (removeEnd < newProducerInner.size() &&
+                       (newProducerInner[removeEnd] == ' ' ||
+                        newProducerInner[removeEnd] == '\t' ||
+                        newProducerInner[removeEnd] == '\n')) ++removeEnd;
+                newProducerInner.erase(stmtStart, removeEnd - stmtStart);
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
 }  // namespace
 
-std::string fuseAdjacentOffloadLoops(const std::string& source) {
+// Parse a single map(...) clause and drop items whose base variable is never
+// referenced inside the associated target data region.  Returns the rewritten
+// clause, or an empty string if the clause has no surviving items.
+static std::string pruneMapClause(const std::string& clause,
+                                  const std::string& regionBody) {
+    // Expected shape: map(modifier : item, item, ...) or map(item, item, ...)
+    size_t open = clause.find('(');
+    if (open == std::string::npos) return clause;
+    size_t close = clause.rfind(')');
+    if (close == std::string::npos || close <= open) return clause;
+
+    std::string head = clause.substr(0, open + 1);  // "map("
+    std::string inner = clause.substr(open + 1, close - open - 1);
+
+    // Determine where the item list starts (after optional modifier ':').
+    size_t colon = inner.find(':');
+    std::string prefix;
+    std::string itemList;
+    if (colon == std::string::npos) {
+        itemList = inner;
+    } else {
+        prefix = inner.substr(0, colon + 1);
+        itemList = inner.substr(colon + 1);
+    }
+
+    // Split items by top-level commas.
+    std::vector<std::string> items;
+    std::string cur;
+    int depth = 0;
+    for (char c : itemList) {
+        if (c == '(' || c == '[') ++depth;
+        else if (c == ')' || c == ']') --depth;
+        if (c == ',' && depth == 0) {
+            items.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    if (!cur.empty()) items.push_back(cur);
+
+    // Keep items whose base identifier appears in the region body.
+    std::vector<std::string> kept;
+    for (const std::string& item : items) {
+        std::string trimmed = item;
+        size_t s = 0;
+        while (s < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[s]))) ++s;
+        size_t e = trimmed.size();
+        while (e > s && std::isspace(static_cast<unsigned char>(trimmed[e - 1]))) --e;
+        trimmed = trimmed.substr(s, e - s);
+        if (trimmed.empty()) continue;
+
+        // Base identifier: up to first '[' or non-identifier char.
+        size_t baseEnd = 0;
+        while (baseEnd < trimmed.size() && isIdentChar(trimmed[baseEnd])) ++baseEnd;
+        std::string base = trimmed.substr(0, baseEnd);
+        if (base.empty()) {
+            kept.push_back(item);
+            continue;
+        }
+
+        // Check for a real use in the body.  A bare occurrence of the name is
+        // enough; generated code always uses arrays as a[...].
+        bool used = false;
+        for (size_t p = 0; (p = regionBody.find(base, p)) != std::string::npos; ++p) {
+            // Ensure this is a whole identifier, not a substring.
+            bool before = (p == 0) || !isIdentChar(regionBody[p - 1]);
+            size_t afterPos = p + base.size();
+            bool after = (afterPos >= regionBody.size()) || !isIdentChar(regionBody[afterPos]);
+            if (before && after) {
+                used = true;
+                break;
+            }
+        }
+        if (used) kept.push_back(item);
+    }
+
+    if (kept.empty()) return "";
+    std::string result = head + prefix;
+    for (size_t i = 0; i < kept.size(); ++i) {
+        if (i) result += ", ";
+        result += kept[i];
+    }
+    result += ")";
+    return result;
+}
+
+// Parse the tail of a GPU pragma into map(...) items and other clauses.
+// Returns a map from direction (to/from/tofrom) to set of item strings, and
+// appends any non-map clauses (e.g. reduction(+:x)) to nonMapOut.
+static void parseMapClauses(const std::string& clauses,
+                            std::map<std::string, std::set<std::string>>& mapsOut,
+                            std::vector<std::string>& nonMapOut) {
+    size_t p = 0;
+    while (p < clauses.size()) {
+        while (p < clauses.size() && std::isspace(static_cast<unsigned char>(clauses[p]))) ++p;
+        if (p >= clauses.size()) break;
+        if (clauses.compare(p, 4, "map(") == 0) {
+            size_t clauseStart = p;
+            size_t clauseEnd = matchDelim(clauses, p + 3, '(', ')');
+            if (clauseEnd == std::string::npos) { ++p; continue; }
+            std::string clause = clauses.substr(clauseStart, clauseEnd - clauseStart + 1);
+            size_t open = clause.find('(');
+            size_t close = clause.rfind(')');
+            if (open != std::string::npos && close != std::string::npos && close > open) {
+                std::string inner = clause.substr(open + 1, close - open - 1);
+                size_t colon = inner.find(':');
+                std::string direction = "tofrom";
+                std::string itemList = inner;
+                if (colon != std::string::npos) {
+                    direction = normalize(inner.substr(0, colon));
+                    itemList = inner.substr(colon + 1);
+                }
+                // Split items.
+                std::string cur;
+                int depth = 0;
+                for (char c : itemList) {
+                    if (c == '(' || c == '[') ++depth;
+                    else if (c == ')' || c == ']') --depth;
+                    if (c == ',' && depth == 0) {
+                        std::string item = normalize(cur);
+                        if (!item.empty()) mapsOut[direction].insert(item);
+                        cur.clear();
+                    } else {
+                        cur += c;
+                    }
+                }
+                std::string item = normalize(cur);
+                if (!item.empty()) mapsOut[direction].insert(item);
+            }
+            p = clauseEnd + 1;
+        } else {
+            // Non-map clause: grab until next map( or end.
+            size_t nextMap = clauses.find("map(", p + 1);
+            std::string nonMap = clauses.substr(p, nextMap - p);
+            std::string trimmed = normalize(nonMap);
+            if (!trimmed.empty()) nonMapOut.push_back(trimmed);
+            p = (nextMap == std::string::npos) ? clauses.size() : nextMap;
+        }
+    }
+}
+
+static std::string mapBaseName(const std::string& item) {
+    size_t i = 0;
+    while (i < item.size() && isIdentChar(item[i])) ++i;
+    return item.substr(0, i);
+}
+
+static int mapDirRank(const std::string& d) {
+    if (d == "tofrom") return 2;
+    if (d == "from") return 1;
+    if (d == "to") return 0;
+    return -1;
+}
+
+// Merge two pragma clause tails.  Map items are unioned by base variable name,
+// preferring stronger directions.  Non-map clauses are concatenated.
+static std::string mergeClauses(const std::string& a, const std::string& b) {
+    std::map<std::string, std::set<std::string>> mapsA, mapsB;
+    std::vector<std::string> nonA, nonB;
+    parseMapClauses(a, mapsA, nonA);
+    parseMapClauses(b, mapsB, nonB);
+
+    // Merge directions, then per base name keep highest rank.
+    std::map<std::string, std::map<std::string, std::string>> byBase; // base -> dir -> item
+    auto absorb = [&](const std::map<std::string, std::set<std::string>>& src) {
+        for (const auto& kv : src) {
+            const std::string& dir = kv.first;
+            for (const std::string& item : kv.second) {
+                std::string base = mapBaseName(item);
+                if (base.empty()) continue;
+                auto& dirMap = byBase[base];
+                auto it = dirMap.find(dir);
+                if (it == dirMap.end() || mapDirRank(dir) > mapDirRank(it->first)) {
+                    dirMap[dir] = item;
+                }
+            }
+        }
+    };
+    absorb(mapsA);
+    absorb(mapsB);
+
+    std::string result;
+    // Emit merged map clauses grouped by direction.
+    for (const auto& dir : {"to", "from", "tofrom"}) {
+        std::vector<std::string> items;
+        for (const auto& kv : byBase) {
+            auto it = kv.second.find(dir);
+            if (it != kv.second.end()) items.push_back(it->second);
+        }
+        if (!items.empty()) {
+            if (!result.empty()) result += " ";
+            result += std::string("map(") + dir + ":";
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (i) result += ", ";
+                result += items[i];
+            }
+            result += ")";
+        }
+    }
+    for (const std::string& c : nonA) {
+        if (!result.empty()) result += " ";
+        result += c;
+    }
+    for (const std::string& c : nonB) {
+        if (!result.empty()) result += " ";
+        result += c;
+    }
+    return result;
+}
+
+// Remove dead map(...) items from #pragma omp target data regions.  An item is
+// dead when its base variable is never referenced in the region body.
+static std::string removeDeadTargetDataMaps(const std::string& source) {
+    const std::string kDataPragma = "#pragma omp target data";
+    std::string out;
+    size_t copyFrom = 0;
+    size_t cursor = 0;
+    bool changed = false;
+
+    while ((cursor = source.find(kDataPragma, cursor)) != std::string::npos) {
+        size_t pragmaStart = cursor;
+        size_t lineEnd = source.find('\n', pragmaStart);
+        if (lineEnd == std::string::npos) lineEnd = source.size();
+        size_t bodyStart = source.find('{', lineEnd);
+        if (bodyStart == std::string::npos) break;
+        size_t bodyEnd = matchDelim(source, bodyStart, '{', '}');
+        if (bodyEnd == std::string::npos) break;
+
+        std::string regionBody = source.substr(bodyStart, bodyEnd - bodyStart + 1);
+        std::string pragmaLine = source.substr(pragmaStart, lineEnd - pragmaStart);
+
+        // Rewrite each map(...) clause on this pragma line.
+        std::string newPragma = pragmaLine;
+        size_t p = 0;
+        while ((p = newPragma.find("map(", p)) != std::string::npos) {
+            size_t clauseStart = p;
+            size_t clauseEnd = matchDelim(newPragma, clauseStart + 3, '(', ')');
+            if (clauseEnd == std::string::npos) { ++p; continue; }
+            std::string clause = newPragma.substr(clauseStart, clauseEnd - clauseStart + 1);
+            std::string rewritten = pruneMapClause(clause, regionBody);
+            if (rewritten.empty()) {
+                // Remove the whole clause, including preceding whitespace.
+                size_t eraseStart = clauseStart;
+                while (eraseStart > 0 && std::isspace(static_cast<unsigned char>(newPragma[eraseStart - 1]))) --eraseStart;
+                newPragma.erase(eraseStart, clauseEnd - eraseStart + 1);
+                p = eraseStart;
+            } else if (rewritten != clause) {
+                newPragma.replace(clauseStart, clause.size(), rewritten);
+                p = clauseStart + rewritten.size();
+            } else {
+                p = clauseEnd + 1;
+            }
+            changed = true;
+        }
+
+        if (newPragma != pragmaLine) {
+            out.append(source, copyFrom, pragmaStart - copyFrom);
+            out += newPragma;
+            copyFrom = lineEnd;
+        }
+        cursor = bodyEnd + 1;
+    }
+
+    if (!changed) return source;
+    out.append(source, copyFrom, source.size() - copyFrom);
+    return out;
+}
+
+static std::string fuseOnePass(const std::string& source) {
     // Collect every bare GPU pragma + for-loop pair.
     const bool debug = std::getenv("LOOMX_FUSION_DEBUG") != nullptr;
     std::vector<LoopRec> recs;
@@ -290,14 +708,12 @@ std::string fuseAdjacentOffloadLoops(const std::string& source) {
             pragmaEnd - cursor - std::char_traits<char>::length(kGpuPragma));
         std::string normTail = normalize(tail);
 
-        // Accept the producer loop if it is bare.  Accept the consumer if it
-        // only carries reduction/schedule clauses we can preserve on the merged
-        // pragma.  Map clauses should already have been hoisted away; reject
-        // any remaining 'map(' clause to stay safe.
+        // Accept the producer loop if it is bare or carries map/reduction
+        // clauses.  Accept the consumer if its clauses can be merged with the
+        // producer's (map, reduction, etc.).  Reject collapse clauses because
+        // merging collapsed nests is not supported.
         bool bare = normTail.empty();
-        bool reducibleConsumer = !bare &&
-                                 normTail.find("map(") == std::string::npos &&
-                                 normTail.find("collapse(") == std::string::npos;
+        bool reducibleConsumer = !bare && normTail.find("collapse(") == std::string::npos;
         if (bare || reducibleConsumer) {
             size_t forStart = source.find_first_not_of(" \t\n\r", pragmaEnd + 1);
             LoopRec rec;
@@ -353,29 +769,29 @@ std::string fuseAdjacentOffloadLoops(const std::string& source) {
         if (!adjacent || !sameSpace || !aPure || !sameIndex || !prodIndex) continue;
 
         // Merge: keep one pragma and loop header, then emit a single body
-        // holding the producer's statements followed by the consumer's.  Use
-        // the consumer's pragma if it carries clauses (e.g. reduction); otherwise
-        // the producer's pragma is fine.
-        // Emitting the producer's whole for-statement here would strand the
-        // consumer's statements after the closing brace, outside any loop.
+        // holding the producer's statements followed by the consumer's.
         // Any declarations that sat between the loops are moved in front of the
         // merged construct so they remain in scope for the consumer body.
         out.append(source, copyFrom, a.pragmaStart - copyFrom);
         out += movableDecls;
-        size_t pragmaKeepStart = a.pragmaStart;
-        size_t pragmaKeepEnd = a.bodyStart;
-        if (!b.clauses.empty()) {
-            // Consumer has clauses (e.g. reduction). Use the consumer's pragma
-            // and for-header (up to the body opening brace).
-            pragmaKeepStart = b.pragmaStart;
-            pragmaKeepEnd = b.bodyStart;
-        }
-        out.append(source, pragmaKeepStart, pragmaKeepEnd - pragmaKeepStart);
+
+        std::string mergedClauses = mergeClauses(a.clauses, b.clauses);
+        out += "#pragma omp target teams distribute parallel for";
+        if (!mergedClauses.empty()) out += " " + mergedClauses;
+        out += "\n";
+        out.append(source, a.forStart, a.bodyStart - a.forStart);
         out += "{\n";
-        out += a.inner;
-        if (!a.inner.empty() && a.inner.back() != '\n') out += "\n";
-        out += b.inner;
-        if (!b.inner.empty() && b.inner.back() != '\n') out += "\n";
+
+        // Try to scalar-replace arrays produced by a and only read by b at the
+        // same index.  This turns reduction_call into the hand-written ideal by
+        // dropping the temporary a[] array entirely.
+        std::string prodBody, consBody;
+        contractProducerArrays(a.inner, b.inner, a.iv, a.writes, prodBody, consBody);
+
+        out += prodBody;
+        if (!prodBody.empty() && prodBody.back() != '\n') out += "\n";
+        out += consBody;
+        if (!consBody.empty() && consBody.back() != '\n') out += "\n";
         out += "  }";
 
         copyFrom = b.forEnd;
@@ -383,12 +799,35 @@ std::string fuseAdjacentOffloadLoops(const std::string& source) {
         ++merges;
     }
 
-    if (!merges) return source;
-    out.append(source, copyFrom, source.size() - copyFrom);
+    if (!merges) {
+        out = source;
+    } else {
+        out.append(source, copyFrom, source.size() - copyFrom);
+        std::cerr << "[LoopFusion] fused " << merges
+                  << " producer/consumer loop pair(s)\n";
+    }
 
-    std::cerr << "[LoopFusion] fused " << merges
-              << " producer/consumer loop pair(s)\n";
+    // After fusion and array contraction some mapped arrays may no longer be
+    // touched inside the target data region.  Dropping them avoids useless
+    // host/device transfers.
+    out = removeDeadTargetDataMaps(out);
     return out;
+}
+
+std::string fuseAdjacentOffloadLoops(const std::string& source) {
+    // Repeatedly fuse adjacent pairs until a fixed point.  The first pass may
+    // create new adjacent producer/consumer pairs (e.g. init+compute fused,
+    // then that result fused with checksum), so iterating is required for
+    // chain fusion.
+    std::string current = source;
+    int iterations = 0;
+    while (true) {
+        std::string next = fuseOnePass(current);
+        if (next == current) break;
+        current = next;
+        if (++iterations > 10) break;  // safety limit
+    }
+    return current;
 }
 
 }  // namespace loomX

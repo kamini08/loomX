@@ -15,7 +15,9 @@ namespace {
 struct ReductionHelperInfo {
     SgFunctionDeclaration* decl = nullptr;
     SgFunctionDefinition* def = nullptr;
-    int reductionParamIdx = -1;          // pointer parameter being reduced into
+    int reductionParamIdx = -1;          // pointer parameter being reduced into (-1 for global)
+    SgInitializedName* reducedGlobal = nullptr; // global variable being reduced into
+    bool isGlobalReduction = false;
     ReductionOp op = ReductionOp::UNKNOWN;
     SgExpression* rhsExpr = nullptr;     // expression on the RHS, in terms of parameters
 };
@@ -63,38 +65,56 @@ static bool isReductionHelperFunction(SgFunctionDefinition* def, ReductionHelper
     if (!expr) return false;
 
     SgInitializedName* reducedParam = nullptr;
+    SgInitializedName* reducedGlobalVar = nullptr;
     SgExpression* rhs = nullptr;
     ReductionOp op = ReductionOp::UNKNOWN;
+    bool isGlobal = false;
 
-    // Case 1: compound assignment *p += expr
+    // Try to identify the reduction target from a compound or simple assignment.
+    auto setOpFromCompound = [&](SgCompoundAssignOp* compound) -> bool {
+        if (isSgPlusAssignOp(compound)) { op = ReductionOp::ADD; return true; }
+        if (isSgMultAssignOp(compound)) { op = ReductionOp::MUL; return true; }
+        if (isSgMinusAssignOp(compound)) { op = ReductionOp::SUB; return true; }
+        if (isSgAndAssignOp(compound)) { op = ReductionOp::BIT_AND; return true; }
+        if (isSgIorAssignOp(compound)) { op = ReductionOp::BIT_OR; return true; }
+        if (isSgXorAssignOp(compound)) { op = ReductionOp::BIT_XOR; return true; }
+        return false;
+    };
+
+    // Case 1: compound assignment (*p += expr) or (global += expr)
     if (SgCompoundAssignOp* compound = isSgCompoundAssignOp(expr)) {
         SgExpression* lhs = skipCastsExpr(compound->get_lhs_operand());
-        SgPointerDerefExp* deref = isSgPointerDerefExp(lhs);
-        if (!deref) return false;
-
-        SgVarRefExp* baseVar = isSgVarRefExp(skipCastsExpr(deref->get_operand()));
-        if (!baseVar) return false;
-        reducedParam = baseVar->get_symbol()->get_declaration();
-
-        if (isSgPlusAssignOp(compound)) op = ReductionOp::ADD;
-        else if (isSgMultAssignOp(compound)) op = ReductionOp::MUL;
-        else if (isSgMinusAssignOp(compound)) op = ReductionOp::SUB;
-        else if (isSgAndAssignOp(compound)) op = ReductionOp::BIT_AND;
-        else if (isSgIorAssignOp(compound)) op = ReductionOp::BIT_OR;
-        else if (isSgXorAssignOp(compound)) op = ReductionOp::BIT_XOR;
-        else return false;
-
+        if (SgPointerDerefExp* deref = isSgPointerDerefExp(lhs)) {
+            SgVarRefExp* baseVar = isSgVarRefExp(skipCastsExpr(deref->get_operand()));
+            if (!baseVar) return false;
+            reducedParam = baseVar->get_symbol()->get_declaration();
+        } else if (SgVarRefExp* varRef = isSgVarRefExp(lhs)) {
+            SgInitializedName* var = varRef->get_symbol()->get_declaration();
+            if (!isGlobalVariable(var)) return false;
+            reducedGlobalVar = var;
+            isGlobal = true;
+        } else {
+            return false;
+        }
+        if (!setOpFromCompound(compound)) return false;
         rhs = compound->get_rhs_operand();
     }
-    // Case 2: simple assignment *p = *p + expr
+    // Case 2: simple assignment (*p = *p + expr) or (global = global + expr)
     else if (SgAssignOp* assign = isSgAssignOp(expr)) {
         SgExpression* lhs = skipCastsExpr(assign->get_lhs_operand());
-        SgPointerDerefExp* deref = isSgPointerDerefExp(lhs);
-        if (!deref) return false;
-
-        SgVarRefExp* baseVar = isSgVarRefExp(skipCastsExpr(deref->get_operand()));
-        if (!baseVar) return false;
-        reducedParam = baseVar->get_symbol()->get_declaration();
+        SgInitializedName* reducedVar = nullptr;
+        if (SgPointerDerefExp* deref = isSgPointerDerefExp(lhs)) {
+            SgVarRefExp* baseVar = isSgVarRefExp(skipCastsExpr(deref->get_operand()));
+            if (!baseVar) return false;
+            reducedVar = reducedParam = baseVar->get_symbol()->get_declaration();
+        } else if (SgVarRefExp* varRef = isSgVarRefExp(lhs)) {
+            SgInitializedName* var = varRef->get_symbol()->get_declaration();
+            if (!isGlobalVariable(var)) return false;
+            reducedVar = reducedGlobalVar = var;
+            isGlobal = true;
+        } else {
+            return false;
+        }
 
         SgExpression* rhsExpr = assign->get_rhs_operand();
         // Look for one of the reduction forms.
@@ -105,10 +125,10 @@ static bool isReductionHelperFunction(SgFunctionDefinition* def, ReductionHelper
                 SgExpression* r = skipCastsExpr(add->get_rhs_operand());
                 SgVarRefExp* lv = isSgVarRefExp(l);
                 SgVarRefExp* rv = isSgVarRefExp(r);
-                if (lv && lv->get_symbol()->get_declaration() == reducedParam && rv) {
+                if (lv && lv->get_symbol()->get_declaration() == reducedVar && rv) {
                     op = ReductionOp::ADD; return {true, r};
                 }
-                if (rv && rv->get_symbol()->get_declaration() == reducedParam && lv) {
+                if (rv && rv->get_symbol()->get_declaration() == reducedVar && lv) {
                     op = ReductionOp::ADD; return {true, l};
                 }
             } else if (SgMultiplyOp* mul = isSgMultiplyOp(e)) {
@@ -116,10 +136,10 @@ static bool isReductionHelperFunction(SgFunctionDefinition* def, ReductionHelper
                 SgExpression* r = skipCastsExpr(mul->get_rhs_operand());
                 SgVarRefExp* lv = isSgVarRefExp(l);
                 SgVarRefExp* rv = isSgVarRefExp(r);
-                if (lv && lv->get_symbol()->get_declaration() == reducedParam && rv) {
+                if (lv && lv->get_symbol()->get_declaration() == reducedVar && rv) {
                     op = ReductionOp::MUL; return {true, r};
                 }
-                if (rv && rv->get_symbol()->get_declaration() == reducedParam && lv) {
+                if (rv && rv->get_symbol()->get_declaration() == reducedVar && lv) {
                     op = ReductionOp::MUL; return {true, l};
                 }
             }
@@ -130,23 +150,25 @@ static bool isReductionHelperFunction(SgFunctionDefinition* def, ReductionHelper
         rhs = result.second;
     }
 
-    if (!reducedParam || !rhs || op == ReductionOp::UNKNOWN) return false;
+    if ((!reducedParam && !reducedGlobalVar) || !rhs || op == ReductionOp::UNKNOWN) return false;
 
-    // The reduced variable must be a pointer parameter of the function.
     SgFunctionDeclaration* decl = def->get_declaration();
     if (!decl) return false;
     SgInitializedNamePtrList& params = decl->get_args();
-    int reductionIdx = -1;
-    for (size_t i = 0; i < params.size(); ++i) {
-        if (params[i] == reducedParam) {
-            reductionIdx = static_cast<int>(i);
-            break;
-        }
-    }
-    if (reductionIdx < 0) return false;
 
-    // The reduced parameter must have pointer or array type.
-    if (!isPointerOrArrayType(reducedParam->get_type())) return false;
+    int reductionIdx = -1;
+    if (!isGlobal) {
+        // The reduced variable must be a pointer parameter of the function.
+        for (size_t i = 0; i < params.size(); ++i) {
+            if (params[i] == reducedParam) {
+                reductionIdx = static_cast<int>(i);
+                break;
+            }
+        }
+        if (reductionIdx < 0) return false;
+        // The reduced parameter must have pointer or array type.
+        if (!isPointerOrArrayType(reducedParam->get_type())) return false;
+    }
 
     // Reject functions with global writes, IO, or other side effects.
     // A quick conservative check: any write to a non-parameter, non-local variable.
@@ -163,6 +185,7 @@ static bool isReductionHelperFunction(SgFunctionDefinition* def, ReductionHelper
             if (!var) continue;
             if (paramSet.count(var)) continue;
             if (var->get_scope() == body) continue;
+            if (isGlobal && var == reducedGlobalVar) continue; // the reduction target is allowed
             return false; // write to global or outer scope
         }
 
@@ -186,6 +209,8 @@ static bool isReductionHelperFunction(SgFunctionDefinition* def, ReductionHelper
     info.decl = decl;
     info.def = def;
     info.reductionParamIdx = reductionIdx;
+    info.reducedGlobal = reducedGlobalVar;
+    info.isGlobalReduction = isGlobal;
     info.op = op;
     info.rhsExpr = rhs;
     return true;
@@ -279,17 +304,27 @@ std::size_t inlineReductionHelpers(SgProject* project) {
         if (!argsExpr) continue;
         std::vector<SgExpression*> args(argsExpr->get_expressions().begin(),
                                          argsExpr->get_expressions().end());
-        if (info.reductionParamIdx >= static_cast<int>(args.size())) continue;
 
-        SgInitializedName* reducedVar = variableFromAddressOf(args[info.reductionParamIdx]);
-        if (!reducedVar) continue;
-
-        // Build param -> arg map, skipping the reduced pointer parameter.
+        SgInitializedName* reducedVar = nullptr;
         SgInitializedNamePtrList& params = info.decl->get_args();
         std::map<SgInitializedName*, SgExpression*> paramToArg;
-        for (size_t i = 0; i < params.size() && i < args.size(); ++i) {
-            if (static_cast<int>(i) == info.reductionParamIdx) continue;
-            paramToArg[params[i]] = args[i];
+
+        if (info.isGlobalReduction) {
+            reducedVar = info.reducedGlobal;
+            if (!reducedVar) continue;
+            // Global reduction: all arguments feed the RHS expression.
+            for (size_t i = 0; i < params.size() && i < args.size(); ++i) {
+                paramToArg[params[i]] = args[i];
+            }
+        } else {
+            if (info.reductionParamIdx >= static_cast<int>(args.size())) continue;
+            reducedVar = variableFromAddressOf(args[info.reductionParamIdx]);
+            if (!reducedVar) continue;
+            // Build param -> arg map, skipping the reduced pointer parameter.
+            for (size_t i = 0; i < params.size() && i < args.size(); ++i) {
+                if (static_cast<int>(i) == info.reductionParamIdx) continue;
+                paramToArg[params[i]] = args[i];
+            }
         }
 
         // Substitute parameters into the RHS expression.
