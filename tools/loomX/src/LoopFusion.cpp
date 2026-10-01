@@ -201,6 +201,23 @@ std::set<std::string> assignedBases(const std::string& inner) {
         size_t baseStart = baseEnd;
         while (baseStart > 0 && isIdentChar(inner[baseStart - 1])) --baseStart;
         if (baseStart == baseEnd) continue;
+
+        // Skip struct/union member arrays: text-based contraction cannot safely
+        // distinguish a[i] from s->a[i] when the base identifier alone is used
+        // as the search key, and replacing only the member part leaves invalid
+        // syntax such as s->(expr).  Whole-member contraction is future work.
+        size_t prefix = baseStart;
+        while (prefix > 0 &&
+               std::isspace(static_cast<unsigned char>(inner[prefix - 1]))) {
+            --prefix;
+        }
+        if (prefix >= 2 && inner[prefix - 1] == '>' && inner[prefix - 2] == '-') {
+            continue;
+        }
+        if (prefix >= 1 && inner[prefix - 1] == '.') {
+            continue;
+        }
+
         out.insert(inner.substr(baseStart, baseEnd - baseStart));
     }
     return out;
@@ -397,28 +414,14 @@ bool contractProducerArrays(const std::string& producerInner,
             }
         }
 
-        // Substitute in consumer.
+        // Substitute the producer's RHS into the consumer's reads so the
+        // consumer can be fused into the producer's loop.  We deliberately
+        // keep the producer assignment: removing it is only a dead-store
+        // optimization, and doing it textually can delete a store that is
+        // still observable later (e.g. v_matvec's y array is printed after
+        // the fused reduction).
         newConsumerInner = substituteArrayRead(newConsumerInner, arr, iv, expr);
-
-        // Remove all producer assignment statements to this array.
-        std::string needle = arr + "[" + iv + "]";
-        for (auto it = assigns.rbegin(); it != assigns.rend(); ++it) {
-            size_t pos = *it;
-            size_t stmtStart = pos;
-            while (stmtStart > 0 && newProducerInner[stmtStart - 1] != ';' &&
-                   newProducerInner[stmtStart - 1] != '\n' &&
-                   newProducerInner[stmtStart - 1] != '{') --stmtStart;
-            size_t stmtEnd = newProducerInner.find(';', pos);
-            if (stmtEnd != std::string::npos) {
-                size_t removeEnd = stmtEnd + 1;
-                while (removeEnd < newProducerInner.size() &&
-                       (newProducerInner[removeEnd] == ' ' ||
-                        newProducerInner[removeEnd] == '\t' ||
-                        newProducerInner[removeEnd] == '\n')) ++removeEnd;
-                newProducerInner.erase(stmtStart, removeEnd - stmtStart);
-                changed = true;
-            }
-        }
+        changed = true;
     }
     return changed;
 }

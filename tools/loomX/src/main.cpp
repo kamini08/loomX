@@ -13,6 +13,7 @@
 #include "LoopAnalysisTypes.h"
 #include "ReductionHelperInliner.h"
 #include "FunctionPointerDevirtualizer.h"
+#include "PureFunctionInliner.h"
 #include <iostream>
 #include <vector>
 #include <fstream>
@@ -454,6 +455,13 @@ void fillMapVariables(SgForStatement* loop, loomX::LoopSummary& summary) {
     }
 
     for (SgInitializedName* var : allVars) {
+        if (!var) continue;
+
+        // Skip struct/class members (e.g. s->atoms->f[ii] exposes 'atoms' and
+        // 'f' as VarRefExps whose scope is a class definition, not the current
+        // function).  Only map real in-scope variables.
+        if (isSgClassDefinition(var->get_scope())) continue;
+
         // Skip loop index variable - it's handled implicitly.
         SgInitializedName* loopVar = SageInterface::getLoopIndexVariable(loop);
         if (var == loopVar) continue;
@@ -799,7 +807,12 @@ int main(int argc, char* argv[]) {
         ipa.printSummaries();
     }
 
-    // Step 1b: Inline reduction helpers so the reduction detector can see
+    // Step 1b: Inline small pure helper functions (e.g. zeroReal3,
+    // calculate_macro_xs) so loop parallelization can see their real memory
+    // accesses and expose more GPU kernels in real HPC projects.
+    loomX::inlinePureHelperFunctions(project, ipa);
+
+    // Step 1c: Inline reduction helpers so the reduction detector can see
     // patterns like "void accum(double x, double* sum) { *sum += x*x; }"
     // called as "accum(a[i], &sum);" inside a loop.
     loomX::inlineReductionHelpers(project);
@@ -1031,6 +1044,9 @@ int main(int argc, char* argv[]) {
         // can promote init_array loops to GPU and the same-function target-data
         // hoister can merge them with the consuming GPU loops).
         accepted.push_back({summary, initHelperLoop});
+        if (summary.target == ParallelTarget::GPU_OFFLOAD) {
+            selectedLoops.insert(loop);
+        }
     }
 
     // Phase-couple init loops with subsequent GPU loops, then emit all
@@ -1073,10 +1089,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Post-processing: force helper-function loops to SEQUENTIAL unless they
-    // are part of a batch or pipeline (which can fuse them into a single
-    // kernel launch). This runs AFTER horizontalSubBatch and pipelinePhaseCouple
-    // so we can check the batched/pipelineStage flags.
+    // Post-processing: helper-function loops are allowed to become standalone
+    // GPU kernels when the cost model says they are profitable.  The only case
+    // we still suppress is a tiny helper loop that is called from inside a host
+    // loop, where one kernel launch per outer iteration would dominate the work.
     for (auto& entry : accepted) {
         loomX::LoopSummary& summary = entry.first;
         SgForStatement* loop = summary.loop;
@@ -1086,16 +1102,18 @@ int main(int argc, char* argv[]) {
         SgFunctionDeclaration* decl = func->get_declaration();
         if (!decl) continue;
         std::string funcName = decl->get_name().getString();
-        bool helperNoOffload = (!funcName.empty() && funcName != "main");
+        if (funcName.empty() || funcName == "main") continue;
 
-        // Helper-function loops must not become standalone GPU kernels.
-        // Exception: allow GPU offload if part of a batch or pipeline.
-        if (summary.target == ParallelTarget::GPU_OFFLOAD &&
-            !summary.batched && summary.pipelineStage < 0) {
-            std::cout << "  -> helper-function loop kept sequential: "
-                      << funcName << "\n";
-            summary.target = ParallelTarget::SEQUENTIAL;
-        }
+        if (summary.target != ParallelTarget::GPU_OFFLOAD) continue;
+        if (summary.batched || summary.pipelineStage >= 0) continue;
+
+        if (summary.iterationCount >= 1000) continue;  // Large enough to amortize one launch
+
+        if (!isCalledInsideLoop(project, funcName)) continue;
+
+        std::cout << "  -> helper-function loop kept sequential: "
+                  << funcName << "\n";
+        summary.target = ParallelTarget::SEQUENTIAL;
     }
 
     for (auto& entry : accepted) {

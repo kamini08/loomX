@@ -82,6 +82,21 @@ std::set<SgInitializedName*> collectEnclosingLoopIndexVariables(SgForStatement* 
     return vars;
 }
 
+// True if var is declared inside the given loop body or any nested scope
+// within it.  Such variables are private to each iteration of the loop.
+bool isDeclaredInsideLoopBody(SgInitializedName* var, SgForStatement* loop) {
+    if (!var || !loop) return false;
+    SgScopeStatement* scope = var->get_scope();
+    if (!scope) return false;
+    SgNode* current = scope;
+    while (current) {
+        if (current == loop->get_loop_body()) return true;
+        if (isSgFunctionDefinition(current)) return false;
+        current = current->get_parent();
+    }
+    return false;
+}
+
 // True if expr references var.
 bool subscriptContainsVar(SgExpression* expr, SgInitializedName* var) {
     if (!expr || !var) return false;
@@ -151,6 +166,10 @@ DependenceResult LoopDependenceAnalysis::analyze(SgForStatement* loop) {
                 if (subscriptContainsAnyNestedLoopVar(sub, nestedLoopVars)) nestedLoopVarInAnySubscript = true;
             }
             if (!currentLoopVarInAnySubscript && nestedLoopVarInAnySubscript) {
+                // If the base variable is declared inside the loop body it is
+                // private to each iteration; no loop-carried dependence exists.
+                if (isDeclaredInsideLoopBody(ref.baseVariable, loop)) continue;
+
                 result.hasLoopCarriedDependence = true;
                 result.description = "write indexed by nested loop variable on " +
                                      ref.baseVariable->get_name().getString();
