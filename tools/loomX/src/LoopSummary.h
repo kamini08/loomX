@@ -40,6 +40,16 @@ struct LoopSummary {
     // loops by GpuProfitability::collapseDepthFor.
     int collapseDepth = 1;
 
+    // Horizontal sub-batching: consecutive small GPU loops fused into one launch.
+    bool batched = false;
+    size_t batchLeader = 0;     // Index of the first loop in the batch
+    size_t batchEnd = 0;        // Index of the last loop in the batch
+
+    // Pipeline phase coupling: multi-stage producer→consumer→reducer chains.
+    int pipelineStage = -1;     // -1 = not in pipeline, 0 = producer, 1 = consumer, 2 = reducer
+    size_t pipelineLeader = 0;  // Index of the producer loop
+    int pipelineLength = 0;     // Number of stages in the pipeline
+
     // Helper: collect just the reduction variables.
     std::set<SgInitializedName*> getReductionVariables() const {
         std::set<SgInitializedName*> vars;

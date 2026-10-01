@@ -424,6 +424,7 @@ void fillPrivateVars(SgForStatement* loop, loomX::LoopSummary& summary) {
 
 // Fill map-clause information for GPU target regions.
 void fillMapVariables(SgForStatement* loop, loomX::LoopSummary& summary) {
+    std::cerr << "[fillMapVariables] Loop at line " << loop->get_file_info()->get_line() << std::endl;
     std::set<SgInitializedName*> allVars;
     Rose_STL_Container<SgNode*> varRefs =
         NodeQuery::querySubTree(loop, V_SgVarRefExp);
@@ -435,6 +436,7 @@ void fillMapVariables(SgForStatement* loop, loomX::LoopSummary& summary) {
     }
 
     std::vector<SgNode*> readRefs, writeRefs;
+    std::cerr << "[fillMapVariables] Found " << allVars.size() << " vars" << std::endl;
     SageInterface::collectReadWriteRefs(loop, readRefs, writeRefs);
 
     std::set<SgInitializedName*> readVars, writeVars;
@@ -948,13 +950,6 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // Helper-function loops must not become standalone GPU kernels.
-        if (helperNoOffload && summary.target == ParallelTarget::GPU_OFFLOAD) {
-            std::cout << "  -> helper-function loop kept sequential: "
-                      << funcName << "\n";
-            summary.target = ParallelTarget::SEQUENTIAL;
-        }
-
         // Apply translation-mode override for ablation experiments.  init_array
         // helper loops are excluded: phase-coupling is a profitable-pipeline
         // concept, so the ablation modes keep their previous (untouched)
@@ -982,12 +977,7 @@ int main(int argc, char* argv[]) {
                 // loop that passed the safety checks is offloaded, including
                 // ones the cost model marked SEQUENTIAL (e.g. below the
                 // CPU-OpenMP FLOP threshold).
-                if (helperNoOffload) {
-                    std::cout << "  -> helper-function loop kept sequential: "
-                              << funcName << "\n";
-                } else {
-                    summary.target = ParallelTarget::GPU_OFFLOAD;
-                }
+                summary.target = ParallelTarget::GPU_OFFLOAD;
             }
         }
 
@@ -1040,7 +1030,6 @@ int main(int argc, char* argv[]) {
         // Defer code generation until the phase-coupling pass has run (so it
         // can promote init_array loops to GPU and the same-function target-data
         // hoister can merge them with the consuming GPU loops).
-        selectedLoops.insert(loop);
         accepted.push_back({summary, initHelperLoop});
     }
 
@@ -1057,6 +1046,55 @@ int main(int argc, char* argv[]) {
 
         for (size_t i = 0; i < accepted.size(); ++i) {
             accepted[i].first = summaries[i];
+        }
+    }
+
+    // Horizontal sub-batching: fuse consecutive small GPU loops sharing arrays
+    // into a single kernel launch to amortize launch overhead.
+    if (mode == TranslationMode::GPU_PROFITABLE && !accepted.empty()) {
+        std::vector<loomX::LoopSummary> summaries;
+        summaries.reserve(accepted.size());
+        for (const auto& entry : accepted) summaries.push_back(entry.first);
+        profitability.horizontalSubBatch(summaries);
+        for (size_t i = 0; i < accepted.size(); ++i) {
+            accepted[i].first = summaries[i];
+        }
+    }
+
+    // Pipeline phase coupling: detect producer→consumer→reducer chains
+    // and mark them for single target-data region wrapping.
+    if (mode == TranslationMode::GPU_PROFITABLE && !accepted.empty()) {
+        std::vector<loomX::LoopSummary> summaries;
+        summaries.reserve(accepted.size());
+        for (const auto& entry : accepted) summaries.push_back(entry.first);
+        profitability.pipelinePhaseCouple(summaries);
+        for (size_t i = 0; i < accepted.size(); ++i) {
+            accepted[i].first = summaries[i];
+        }
+    }
+
+    // Post-processing: force helper-function loops to SEQUENTIAL unless they
+    // are part of a batch or pipeline (which can fuse them into a single
+    // kernel launch). This runs AFTER horizontalSubBatch and pipelinePhaseCouple
+    // so we can check the batched/pipelineStage flags.
+    for (auto& entry : accepted) {
+        loomX::LoopSummary& summary = entry.first;
+        SgForStatement* loop = summary.loop;
+        if (!loop) continue;
+        SgFunctionDefinition* func = SageInterface::getEnclosingProcedure(loop, true);
+        if (!func) continue;
+        SgFunctionDeclaration* decl = func->get_declaration();
+        if (!decl) continue;
+        std::string funcName = decl->get_name().getString();
+        bool helperNoOffload = (!funcName.empty() && funcName != "main");
+
+        // Helper-function loops must not become standalone GPU kernels.
+        // Exception: allow GPU offload if part of a batch or pipeline.
+        if (summary.target == ParallelTarget::GPU_OFFLOAD &&
+            !summary.batched && summary.pipelineStage < 0) {
+            std::cout << "  -> helper-function loop kept sequential: "
+                      << funcName << "\n";
+            summary.target = ParallelTarget::SEQUENTIAL;
         }
     }
 

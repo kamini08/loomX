@@ -34,13 +34,13 @@ public:
     // must be in program order.
     void phaseCoupleInitLoops(std::vector<loomX::LoopSummary>& summaries);
 
-    // Promote sequential loops that sit between two GPU loops in the same
-    // function to GPU_OFFLOAD, avoiding target-data teardown / restart overhead.
-    void bridgeSequentialLoops(std::vector<std::pair<loomX::LoopSummary, bool>>& accepted) const;
+    // Horizontal sub-batching: fuse consecutive small GPU loops sharing arrays
+    // into a single kernel launch to amortize launch overhead.
+    void horizontalSubBatch(std::vector<loomX::LoopSummary>& summaries);
 
-    // True if the loop is safe for GPU offload (canonical, regular, not strongly
-    // divergent), regardless of profitability.
-    bool isGpuSafe(const loomX::LoopSummary& summary) const;
+    // Pipeline phase coupling: detect producer→consumer→reducer chains and
+    // mark them for single target-data region wrapping.
+    void pipelinePhaseCouple(std::vector<loomX::LoopSummary>& summaries);
 
     // Compute the perfect-nest depth for a "collapse(N)" clause on a
     // GPU-offloaded loop.  Returns >= 2 when the loop heads a perfect nest of
@@ -68,12 +68,7 @@ private:
     loomX::ComputeIntensityEstimator intensityEstimator_;
     loomX::ProfitabilityConfig config_;
 
-    // `passLabel` only affects the diagnostic line. The target is decided
-    // twice on purpose: once from purely local information, then again after
-    // interprocedural callee work has been folded into the intensity estimate.
-    // The second verdict is the one that is acted on.
-    loomX::ParallelTarget decideTarget(const loomX::LoopSummary& summary,
-                                       const char* passLabel = "local");
+    loomX::ParallelTarget decideTarget(const loomX::LoopSummary& summary);
 
     // Cost-model estimates (abstract time units).
     double estimateCpuTime(const loomX::LoopSummary& summary) const;

@@ -62,6 +62,268 @@ void collectArrayAccessVars(SgStatement* body,
 
 } // namespace
 
+// ========================================================================
+// Loop Archetype Classification (inspired by H-ROCKS operation classification)
+// ========================================================================
+// Classifies loops by semantic pattern rather than just raw FLOPs.
+// This allows per-archetype profitability thresholds and codegen hints.
+
+loomX::LoopArchetype classify_loop_archetype(SgForStatement* loop,
+                                              const loomX::ComputeIntensityResult& intensity,
+                                              const loomX::CanonicalResult& canonical,
+                                              loomX::LoopCanonicalChecker& canonicalChecker) {
+    using namespace loomX;
+    if (!loop) return LoopArchetype::UNKNOWN;
+
+    SgStatement* body = loop->get_loop_body();
+    if (!body) return LoopArchetype::UNKNOWN;
+
+    // 1. Check for heavy transcendental math
+    if (intensity.hasHeavyMath) {
+        return LoopArchetype::TRANSCENDENTAL_HEAVY;
+    }
+
+    // 1b. Check for compute-heavy (high FLOP count without transcendental math)
+    // Threshold: > 1M FLOPs or high FLOP/byte ratio
+    if (intensity.flopCount > 1000000 || intensity.flopsPerMemoryOp > 16.0) {
+        return LoopArchetype::COMPUTE_HEAVY;
+    }
+
+    // 2. Check for control flow divergence
+    if (intensity.classification == IntensityClass::UNKNOWN) {
+        // Can't determine, but if there are many branches...
+        Rose_STL_Container<SgNode*> ifStmts = NodeQuery::querySubTree(body, V_SgIfStmt);
+        if (ifStmts.size() > 2) {
+            return LoopArchetype::CONTROL_FLOW_HEAVY;
+        }
+    }
+
+    // 3. Check for reduction pattern (including +=, -=, and regular assignments with + or -)
+    Rose_STL_Container<SgNode*> assignOps = NodeQuery::querySubTree(body, V_SgAssignOp);
+    Rose_STL_Container<SgNode*> plusAssignOps = NodeQuery::querySubTree(body, V_SgPlusAssignOp);
+    Rose_STL_Container<SgNode*> minusAssignOps = NodeQuery::querySubTree(body, V_SgMinusAssignOp);
+    if (!plusAssignOps.empty() || !minusAssignOps.empty()) {
+        // Check if it's a scalar reduction (+= or -=)
+        for (SgNode* node : plusAssignOps) {
+            SgPlusAssignOp* plusAssign = isSgPlusAssignOp(node);
+            if (plusAssign) {
+                SgVarRefExp* lhs = isSgVarRefExp(plusAssign->get_lhs_operand());
+                if (lhs) {
+                    // Scalar reduction (sum += ...)
+                    return LoopArchetype::REDUCTION_SUM;
+                }
+            }
+        }
+        for (SgNode* node : minusAssignOps) {
+            SgMinusAssignOp* minusAssign = isSgMinusAssignOp(node);
+            if (minusAssign) {
+                SgVarRefExp* lhs = isSgVarRefExp(minusAssign->get_lhs_operand());
+                if (lhs) {
+                    // Scalar reduction (diff -= ...)
+                    return LoopArchetype::REDUCTION_SUM;
+                }
+            }
+        }
+    }
+    // Also check regular assignments with + or - on RHS (e.g., sum = sum + a[i])
+    if (!assignOps.empty()) {
+        for (SgNode* node : assignOps) {
+            SgAssignOp* assign = isSgAssignOp(node);
+            if (!assign) continue;
+            SgVarRefExp* lhs = isSgVarRefExp(assign->get_lhs_operand());
+            if (!lhs) continue;
+            SgExpression* rhs = assign->get_rhs_operand();
+            if (!rhs) continue;
+            // Check if RHS is a binary add/subtract with LHS variable as one operand
+            SgBinaryOp* binOp = isSgBinaryOp(rhs);
+            if (!binOp) continue;
+            SgExpression* lhs_rhs = binOp->get_lhs_operand();
+            SgExpression* rhs_rhs = binOp->get_rhs_operand();
+            bool lhs_is_loop_var = false;
+            if (SgVarRefExp* lhs_var = isSgVarRefExp(lhs_rhs)) {
+                if (lhs_var->get_symbol()->get_declaration() == lhs->get_symbol()->get_declaration()) {
+                    lhs_is_loop_var = true;
+                }
+            }
+            bool rhs_is_loop_var = false;
+            if (SgVarRefExp* rhs_var = isSgVarRefExp(rhs_rhs)) {
+                if (rhs_var->get_symbol()->get_declaration() == lhs->get_symbol()->get_declaration()) {
+                    rhs_is_loop_var = true;
+                }
+            }
+            if ((isSgAddOp(binOp) || isSgSubtractOp(binOp)) && (lhs_is_loop_var || rhs_is_loop_var)) {
+                // Pattern: sum = sum + a[i] or sum = sum - a[i] or sum = a[i] + sum
+                return LoopArchetype::REDUCTION_SUM;
+            }
+        }
+    }
+
+    // 4. Collect array access patterns
+    Rose_STL_Container<SgNode*> arrRefs = NodeQuery::querySubTree(body, V_SgPntrArrRefExp);
+    if (arrRefs.empty()) {
+        return LoopArchetype::UNKNOWN;
+    }
+
+    // Check for multi-dimensional arrays and nesting
+    std::set<std::string> arrayNames;
+    std::map<std::string, std::set<int>> arrayDimensions; // array -> set of dims
+    bool hasIndirectAccess = false;
+    bool hasStencilPattern = false;
+    int maxNestDepth = 0;
+
+    for (SgNode* node : arrRefs) {
+        SgPntrArrRefExp* arrRef = isSgPntrArrRefExp(node);
+        if (!arrRef) continue;
+
+        SgExpression* base = arrRef->get_lhs_operand();
+        int dimCount = 0;
+        while (SgPntrArrRefExp* nested = isSgPntrArrRefExp(base)) {
+            base = nested->get_lhs_operand();
+            dimCount++;
+        }
+        dimCount++; // outermost
+
+        if (SgVarRefExp* varRef = isSgVarRefExp(base)) {
+            std::string name = varRef->get_symbol()->get_declaration()->get_name().getString();
+            arrayNames.insert(name);
+            arrayDimensions[name].insert(dimCount);
+        }
+
+        // Check index expressions for indirect access or stencil
+        SgExpression* index = arrRef->get_rhs_operand();
+        if (index) {
+            // Check for function calls in index (indirect)
+            Rose_STL_Container<SgNode*> calls = NodeQuery::querySubTree(index, V_SgFunctionCallExp);
+            if (!calls.empty()) {
+                hasIndirectAccess = true;
+            }
+            // Check for i±constant (stencil)
+            // This is simplified; full check would walk the expression tree
+            if (SgBinaryOp* binOp = isSgBinaryOp(index)) {
+                SgExpression* lhs = binOp->get_lhs_operand();
+                SgExpression* rhs = binOp->get_rhs_operand();
+                if (isSgAddOp(binOp) || isSgSubtractOp(binOp)) {
+                    if (isSgVarRefExp(lhs) && isSgIntVal(rhs)) hasStencilPattern = true;
+                    if (isSgVarRefExp(rhs) && isSgIntVal(lhs)) hasStencilPattern = true;
+                }
+            }
+        }
+    }
+
+    // 5. Determine nest depth and structure
+    // Check if this is an outer loop with canonical inner loops
+    Rose_STL_Container<SgNode*> nestedLoops = NodeQuery::querySubTree(body, V_SgForStatement);
+    for (SgNode* node : nestedLoops) {
+        SgForStatement* nested = isSgForStatement(node);
+        if (!nested) continue;
+        CanonicalResult nestedCanon = canonicalChecker.analyze(nested);
+        if (nestedCanon.form == CanonicalForm::CANONICAL) {
+            maxNestDepth = std::max(maxNestDepth, 2);
+            // Check inner loop's inner loops
+            Rose_STL_Container<SgNode*> innerNested = NodeQuery::querySubTree(nested->get_loop_body(), V_SgForStatement);
+            if (!innerNested.empty()) maxNestDepth = 3;
+        }
+    }
+
+    // 6. Classify based on patterns
+    // Stencil detection: i±constant in array index
+    if (hasStencilPattern) {
+        if (maxNestDepth >= 3) return LoopArchetype::STENCIL_3D;
+        if (maxNestDepth >= 2) return LoopArchetype::STENCIL_2D;
+        return LoopArchetype::STENCIL_1D;
+    }
+
+    // GEMM: 3-deep nest with 3+ arrays, inner loop does C[i][j] += A[i][k]*B[k][j]
+    if (maxNestDepth >= 3) {
+        int arrayCount = 0;
+        for (SgNode* node : arrRefs) {
+            SgPntrArrRefExp* arrRef = isSgPntrArrRefExp(node);
+            if (!arrRef) continue;
+            SgExpression* base = arrRef->get_lhs_operand();
+            while (SgPntrArrRefExp* nested = isSgPntrArrRefExp(base)) {
+                base = nested->get_lhs_operand();
+            }
+            if (SgVarRefExp* varRef = isSgVarRefExp(base)) {
+                arrayCount++;
+            }
+        }
+        if (arrayCount >= 3) return LoopArchetype::DENSE_GEMM;
+    }
+
+    // SYRK: 2-deep nest, C[i][j] += A[i][k]*A[j][k]
+    if (maxNestDepth >= 2) {
+        std::set<std::string> uniqueArrays;
+        std::map<std::string, int> arrayRefCount;
+        for (SgNode* node : arrRefs) {
+            SgPntrArrRefExp* arrRef = isSgPntrArrRefExp(node);
+            if (!arrRef) continue;
+            SgExpression* base = arrRef->get_lhs_operand();
+            while (SgPntrArrRefExp* nested = isSgPntrArrRefExp(base)) {
+                base = nested->get_lhs_operand();
+            }
+            if (SgVarRefExp* varRef = isSgVarRefExp(base)) {
+                uniqueArrays.insert(varRef->get_symbol()->get_declaration()->get_name().getString());
+                arrayRefCount[varRef->get_symbol()->get_declaration()->get_name().getString()]++;
+            }
+        }
+        // SYRK pattern: exactly 2 unique arrays (C and A), C is written, A is read twice with different indices
+        if (uniqueArrays.size() == 2 && hasIndirectAccess == false) {
+            return LoopArchetype::DENSE_SYRK;
+        }
+    }
+
+    // Stencil detection: i±constant in array index
+    if (hasStencilPattern) {
+        if (maxNestDepth >= 3) return LoopArchetype::STENCIL_3D;
+        if (maxNestDepth >= 2) return LoopArchetype::STENCIL_2D;
+        return LoopArchetype::STENCIL_1D;
+    }
+
+    // Sparse/indirect access
+    if (hasIndirectAccess) {
+        return LoopArchetype::SPARSE_SPMV;
+    }
+
+    // Memory copy/scale: single read array, single write array, no compute
+    if (arrayNames.size() == 2 && intensity.flopCount < 10) {
+        // Check if it's just B[i] = A[i] or B[i] = alpha*A[i]
+        long writeCount = 0, readCount = 0;
+        std::vector<SgNode*> writeRefs, readRefs;
+        SageInterface::collectReadWriteRefs(body, readRefs, writeRefs);
+        if (writeRefs.size() == 1 && readRefs.size() == 1) {
+            if (intensity.flopCount == 0) return LoopArchetype::MEMORY_COPY;
+            if (intensity.flopCount <= 3) return LoopArchetype::MEMORY_SCALE;
+        }
+    }
+
+    // Control flow heavy
+    if (intensity.classification == IntensityClass::UNKNOWN) {
+        Rose_STL_Container<SgNode*> ifStmts = NodeQuery::querySubTree(body, V_SgIfStmt);
+        if (ifStmts.size() > 2) {
+            return LoopArchetype::CONTROL_FLOW_HEAVY;
+        }
+    }
+
+    // Sparse/indirect access
+    if (hasIndirectAccess) {
+        return LoopArchetype::SPARSE_SPMV;
+    }
+
+    // Memory copy/scale: single read array, single write array, no compute
+    if (arrayNames.size() == 2 && intensity.flopCount < 10) {
+        // Check if it's just B[i] = A[i] or B[i] = alpha*A[i]
+        long writeCount = 0, readCount = 0;
+        std::vector<SgNode*> writeRefs, readRefs;
+        SageInterface::collectReadWriteRefs(body, readRefs, writeRefs);
+        if (writeRefs.size() == 1 && readRefs.size() == 1) {
+            if (intensity.flopCount == 0) return LoopArchetype::MEMORY_COPY;
+            if (intensity.flopCount <= 3) return LoopArchetype::MEMORY_SCALE;
+        }
+    }
+
+    return LoopArchetype::UNKNOWN;
+}
+
 // Return the next loop in a perfectly-nested chain: the loop whose body is a
 // single for-statement (either directly, or as the only statement of an
 // enclosing basic block).  Returns null when the body is not a single loop,
@@ -263,7 +525,7 @@ double GpuProfitability::estimateGpuTime(const loomX::LoopSummary& summary) cons
 }
 
 void GpuProfitability::reevaluateTarget(loomX::LoopSummary& summary) {
-    summary.target = decideTarget(summary, "callee-augmented");
+    summary.target = decideTarget(summary);
 }
 
 void GpuProfitability::phaseCoupleInitLoops(
@@ -355,14 +617,12 @@ void GpuProfitability::phaseCoupleInitLoops(
     }
 }
 
-ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary,
-                                              const char* passLabel) {
+ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary) {
     SgForStatement* loop = summary.loop;
 
     // Non-canonical loops cannot be safely parallelized.
     if (summary.canonical.form != loomX::CanonicalForm::CANONICAL) {
-        std::cout << "[GpuProfitability] pass=" << passLabel
-                  << " Loop at line "
+        std::cout << "[GpuProfitability] Loop at line "
                   << loop->get_file_info()->get_line()
                   << " non-canonical (" << summary.canonical.note << ")\n";
         return ParallelTarget::SEQUENTIAL;
@@ -387,8 +647,23 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary,
     double gpuTime = estimateGpuTime(summary);
     double speedup = (gpuTime > 0.0) ? (cpuTime / gpuTime) : 0.0;
 
-    std::cout << "[GpuProfitability] pass=" << passLabel
-              << " Loop at line "
+    // --- Loop Archetype Classification (H-ROCKS inspired) ---
+    LoopArchetype archetype = classify_loop_archetype(loop, summary.intensity, summary.canonical, canonicalChecker_);
+    auto archProfileIt = ARCHETYPE_PROFILES.find(archetype);
+    const ArchetypeProfile* archProfile = (archProfileIt != ARCHETYPE_PROFILES.end()) ? &archProfileIt->second : nullptr;
+
+    // Override thresholds based on archetype
+    double effectiveMinGpuSpeedup = config_.minGpuSpeedup;
+    long effectiveMinIterForGpu = config_.minIterationsForGPU;
+    long long effectiveMinTotalFlopForGPU = config_.minTotalFlopForGPU;
+    if (archProfile) {
+        effectiveMinGpuSpeedup = archProfile->min_speedup_threshold;
+        effectiveMinIterForGpu = archProfile->min_iterations_for_gpu;
+        effectiveMinTotalFlopForGPU = archProfile->min_total_flop_for_gpu;
+        // For known archetypes, the profile thresholds are authoritative
+    }
+
+    std::cout << "[GpuProfitability] Loop at line "
               << loop->get_file_info()->get_line()
               << " iterations=" << iterations
               << " regular=" << regular
@@ -399,9 +674,13 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary,
               << " totalFlops=" << totalWork
               << " initLoop=" << initLoop
               << " reductionOnly=" << reductionOnly
+              << " archetype=" << static_cast<int>(archetype)
               << " cpuTime=" << cpuTime
               << " gpuTime=" << gpuTime
               << " speedup=" << speedup
+              << " effMinGpuSpeedup=" << effectiveMinGpuSpeedup
+              << " effMinIterForGpu=" << effectiveMinIterForGpu
+              << " effMinTotalFlopForGPU=" << effectiveMinTotalFlopForGPU
               << " (" << summary.intensity.note << ")"
               << "\n";
 
@@ -447,9 +726,16 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary,
     // Primary GPU rule: enough total work and estimated speedup.  The cost
     // model (including data-transfer latency) is what keeps small or memory-
     // bound loops on the CPU.
-    if (totalWork >= config_.minTotalFlopForGPU &&
-        speedup >= config_.minGpuSpeedup) {
-        return ParallelTarget::GPU_OFFLOAD;
+    if (totalWork >= effectiveMinTotalFlopForGPU &&
+        speedup >= effectiveMinGpuSpeedup &&
+        iterations >= effectiveMinIterForGpu) {
+        // Memory-bound-by-nature archetypes never go to GPU
+        if (archProfile && archProfile->is_memory_bound_by_nature &&
+            archetype != LoopArchetype::TRANSCENDENTAL_HEAVY) {
+            // Fall through to CPU
+        } else {
+            return ParallelTarget::GPU_OFFLOAD;
+        }
     }
 
     // Secondary GPU rule: compute-bound outer loops with nested canonical loops
@@ -457,9 +743,15 @@ ParallelTarget GpuProfitability::decideTarget(const loomX::LoopSummary& summary,
     // the work but where the outer loop trip count alone is modest.
     if (computeHeavy && regular && hasNestedLoops(loop) &&
         summary.intensity.flopCount >= config_.minNestedFlopForGPU &&
-        totalWork >= config_.minTotalFlopForGPU &&
-        speedup >= config_.minGpuSpeedup) {
-        return ParallelTarget::GPU_OFFLOAD;
+        totalWork >= effectiveMinTotalFlopForGPU &&
+        speedup >= effectiveMinGpuSpeedup &&
+        iterations >= effectiveMinIterForGpu) {
+        if (archProfile && archProfile->is_memory_bound_by_nature &&
+            archetype != LoopArchetype::TRANSCENDENTAL_HEAVY) {
+            // Fall through to CPU
+        } else {
+            return ParallelTarget::GPU_OFFLOAD;
+        }
     }
 
     if (iterations >= config_.minIterationsForParallel && cpuOpenmpWorthwhile()) {
@@ -617,4 +909,160 @@ bool GpuProfitability::isOutermostLoop(SgForStatement* loop) const {
         parent = parent->get_parent();
     }
     return true;
+}
+
+// ========================================================================
+// Horizontal Sub-Batching: Fuse consecutive small GPU loops sharing arrays
+// ========================================================================
+void GpuProfitability::horizontalSubBatch(std::vector<loomX::LoopSummary>& summaries) {
+    if (summaries.size() < 2) return;
+    
+    const size_t n = summaries.size();
+    std::vector<std::set<std::string>> reads(n), writes(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (summaries[i].loop) {
+            collectArrayAccessVars(summaries[i].loop->get_loop_body(),
+                                   reads[i], writes[i]);
+        }
+    }
+
+    auto isNestedInside = [](SgForStatement* inner, SgForStatement* outer) -> bool {
+        if (!inner || !outer) return false;
+        SgNode* parent = inner->get_parent();
+        while (parent) {
+            if (parent == outer) return true;
+            parent = parent->get_parent();
+        }
+        return false;
+    };
+
+    for (size_t i = 0; i < n; ++i) {
+        if (summaries[i].target != loomX::ParallelTarget::GPU_OFFLOAD) continue;
+        long iter = summaries[i].iterationCount;
+        if (iter >= 0 && iter >= 50000) continue;
+        
+        // Look ahead for consecutive loops with overlapping arrays
+        size_t batchEnd = i;
+        std::set<std::string> batchArrays;
+        std::set<std::string> readSet, writeSet;
+        
+        // Initialize with first loop's arrays
+        for (const auto& r : reads[i]) readSet.insert(r);
+        for (const auto& w : writes[i]) writeSet.insert(w);
+        
+        long totalIters = summaries[i].iterationCount >= 0 ? summaries[i].iterationCount : 0;
+        
+        for (size_t j = i + 1; j < n; ++j) {
+            // Skip non-GPU loops that don't access batch arrays
+            if (summaries[j].target != loomX::ParallelTarget::GPU_OFFLOAD) {
+                // Check if this CPU loop accesses batch arrays - if so, it would conflict
+                bool conflict = false;
+                for (const auto& r : reads[j]) if (writeSet.count(r)) { conflict = true; break; }
+                for (const auto& w : writes[j]) if (readSet.count(w) || writeSet.count(w)) { conflict = true; break; }
+                if (conflict) break;
+                // Non-conflicting CPU loop - skip and continue looking
+                continue;
+            }
+            long iterJ = summaries[j].iterationCount;
+            if (iterJ >= 0 && iterJ >= 50000) break;
+            
+            // Skip inner reduction-only loops (typically inner loops)
+            if (!summaries[j].reductions.empty()) continue;
+            
+            // Skip loops nested inside another loop in the same function (inner loops)
+            bool isInner = false;
+            for (size_t k = 0; k < j; ++k) {
+                if (isNestedInside(summaries[j].loop, summaries[k].loop)) {
+                    isInner = true;
+                    break;
+                }
+            }
+            if (isInner) continue;
+            
+            // Check array overlap
+            bool overlap = false;
+            for (const auto& r : reads[j]) if (writeSet.count(r)) { overlap = true; break; }
+            for (const auto& w : writes[j]) if (readSet.count(w) || writeSet.count(w)) { overlap = true; break; }
+            if (!overlap) break;
+            
+            // Merge arrays
+            for (const auto& r : reads[j]) readSet.insert(r);
+            for (const auto& w : writes[j]) writeSet.insert(w);
+            totalIters += (summaries[j].iterationCount >= 0 ? summaries[j].iterationCount : 0);
+            
+            // Check if bounds are compatible for potential collapse
+            if (!summaries[i].canonical.sameBounds(summaries[j].canonical)) {
+                // Different bounds - note but continue
+            }
+            
+            batchEnd = j;
+        }
+        
+        if (batchEnd > i) {
+            // Mark for batched execution
+            for (size_t k = i; k <= batchEnd; ++k) {
+                summaries[k].batched = true;
+                summaries[k].batchLeader = i;
+                summaries[k].batchEnd = batchEnd;
+            }
+            i = batchEnd;  // Skip processed loops
+        }
+    }
+}
+
+// ========================================================================
+// Pipeline Phase Coupling: Producer → Consumer → Reducer chains
+// ========================================================================
+void GpuProfitability::pipelinePhaseCouple(std::vector<loomX::LoopSummary>& summaries) {
+    if (summaries.size() < 2) return;
+    
+    const size_t n = summaries.size();
+    std::vector<std::set<std::string>> reads(n), writes(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (summaries[i].loop) {
+            collectArrayAccessVars(summaries[i].loop->get_loop_body(),
+                                   reads[i], writes[i]);
+        }
+    }
+    
+    // Find pipeline chains: Producer → Consumer → Reducer
+    std::vector<bool> used(n, false);
+    
+    for (size_t i = 0; i < n; ++i) {
+        if (used[i] || summaries[i].target != loomX::ParallelTarget::GPU_OFFLOAD) continue;
+        
+        std::vector<size_t> pipeline;
+        pipeline.push_back(i);
+        used[i] = true;
+        
+        // Look for consecutive stages
+        for (size_t j = i + 1; j < n; ++j) {
+            if (summaries[j].target != loomX::ParallelTarget::GPU_OFFLOAD) break;
+            if (used[j]) continue;
+            
+            // Check if j consumes what j-1 produces
+            bool consumes = false;
+            for (const auto& w : writes[j-1]) {
+                if (reads[j].count(w)) { consumes = true; break; }
+            }
+            // Or if it's a reducer
+            bool isReducer = !summaries[j].reductions.empty();
+            
+            if (consumes || isReducer) {
+                pipeline.push_back(j);
+                used[j] = true;
+            } else {
+                break;
+            }
+        }
+        
+        if (pipeline.size() >= 2) {
+            // Mark pipeline stages
+            for (size_t k = 0; k < pipeline.size(); ++k) {
+                summaries[pipeline[k]].pipelineStage = k;
+                summaries[pipeline[k]].pipelineLeader = pipeline[0];
+                summaries[pipeline[k]].pipelineLength = pipeline.size();
+            }
+        }
+    }
 }
