@@ -609,7 +609,7 @@ bool GpuProfitability::hasNestedLoops(SgForStatement* loop) {
     return !nested.empty();
 }
 
-bool GpuProfitability::isOutermostLoop(SgForStatement* loop) {
+bool GpuProfitability::isOutermostLoop(SgForStatement* loop) const {
     if (!loop) return false;
     SgNode* parent = loop->get_parent();
     while (parent) {

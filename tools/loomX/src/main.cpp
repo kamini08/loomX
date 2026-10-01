@@ -147,6 +147,29 @@ static std::string getEnclosingFunctionName(SgNode* node) {
     return "";
 }
 
+// True if any call to funcName appears inside a for-loop body.  This is used
+// to keep helper-function loops sequential when they would otherwise launch
+// one GPU kernel per outer-loop iteration (e.g. local_array's convolve_local),
+// while still allowing one-shot helpers like CoMD's ljForce to offload.
+static bool isCalledInsideLoop(SgProject* project, const std::string& funcName) {
+    if (funcName.empty()) return false;
+    Rose_STL_Container<SgNode*> calls =
+        NodeQuery::querySubTree(project, V_SgFunctionCallExp);
+    for (SgNode* node : calls) {
+        SgFunctionCallExp* call = isSgFunctionCallExp(node);
+        if (!call) continue;
+        SgFunctionDeclaration* decl = call->getAssociatedFunctionDeclaration();
+        if (!decl) continue;
+        if (decl->get_name().getString() != funcName) continue;
+        SgNode* parent = call->get_parent();
+        while (parent) {
+            if (isSgForStatement(parent)) return true;
+            parent = parent->get_parent();
+        }
+    }
+    return false;
+}
+
 // Check for loop-carried dependences through scalar variables that are not
 // recognized as reductions.
 //
@@ -837,12 +860,15 @@ int main(int argc, char* argv[]) {
         }
         bool initHelperLoop = (funcName == "init_array");
 
-        // Loops inside helper functions that are called from host code should
-        // not become separate GPU kernels: one kernel launch per call is
-        // catastrophic for helpers called inside a host loop (e.g. local_array's
-        // convolve_local).  init_array helpers are exempt because phase-coupling
-        // may legitimately promote them into a consuming GPU kernel.
-        bool helperNoOffload = (!funcName.empty() && funcName != "main" && !initHelperLoop);
+        // Loops inside helper functions that are called from inside a host loop
+        // should not become separate GPU kernels: one kernel launch per call is
+        // catastrophic (e.g. local_array's convolve_local).  One-shot helpers
+        // like CoMD's ljForce (called once per timestep) can still offload.
+        // init_array helpers are exempt because phase-coupling may promote them
+        // into a consuming GPU kernel.
+        bool helperNoOffload = (!funcName.empty() && funcName != "main" &&
+                                !initHelperLoop &&
+                                isCalledInsideLoop(project, funcName));
 
         // Skip loops nested inside already-parallelized loops
         bool nested = false;
