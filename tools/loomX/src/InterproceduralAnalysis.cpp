@@ -452,16 +452,26 @@ void InterproceduralAnalysis::analyzeFunction(SgFunctionDeclaration* funcDecl) {
             // Parameters are not global.
             if (paramSet.find(var) != paramSet.end()) continue;
 
-            // Locals are not global.
+            // Locals are not global.  A variable declared anywhere inside the
+            // function body (including nested blocks/loops) is local.
             SgScopeStatement* varScope = var->get_scope();
-            if (varScope == body) continue;
+            bool declaredInsideFunction = false;
+            SgNode* cur = varScope;
+            while (cur && !isSgFunctionDefinition(cur)) {
+                if (cur == body) {
+                    declaredInsideFunction = true;
+                    break;
+                }
+                cur = cur->get_parent();
+            }
+            if (declaredInsideFunction) continue;
 
             // Pointer/array parameter dereferences are handled separately.
             if (paramSet.find(var) != paramSet.end() && loomX::isPointerOrArrayType(var->get_type()))
                 continue;
 
             // Anything else (global, file-static, outer scope) counts.
-            if (isSgGlobal(varScope) || varScope != body) {
+            if (isSgGlobal(varScope)) {
                 summary.hasGlobalWrites = true;
                 break;
             }

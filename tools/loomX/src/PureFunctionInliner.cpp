@@ -98,15 +98,17 @@ std::size_t inlinePureHelperFunctions(SgProject* project,
         if (summary->inRecursiveCycle) continue;
         // Pointer writes through parameters are OK to inline: after
         // substitution the caller's dependence analysis sees them in context.
-        // Reject only real side effects (I/O, globals).
+        // Reject only real side effects (I/O, globals, recursion).  We allow
+        // non-leaf helpers (e.g. XSBench's calculate_macro_xs calls grid_search)
+        // because their callees remain ordinary function calls inside the
+        // expanded body and are then subject to the normal call-safety check.
         if (summary->hasIOSideEffects) continue;
         if (summary->hasGlobalWrites) continue;
-        // For the first version, inline only leaf helpers to avoid the
-        // ordering problem of helper A calling helper B.
-        if (!summary->isLeaf) continue;
 
         // Reject functions that are too large to inline blindly.
-        if (astNodeCount(def) > 200) continue;
+        // 5000 nodes is roughly a few hundred lines of C, enough for
+        // helper kernels like XSBench's calculate_macro_xs.
+        if (astNodeCount(def) > 5000) continue;
 
         candidates.insert(name);
     }
